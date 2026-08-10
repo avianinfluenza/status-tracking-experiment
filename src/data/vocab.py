@@ -21,10 +21,10 @@ VOCAB = NAMES + COLORS + [TOPIC, CONJ, SUBJ, BALL, HAVE, SWAP, PERIOD, PAD] + SL
 TOK2ID = {t: i for i, t in enumerate(VOCAB)}
 ID2TOK = {i: t for t, i in TOK2ID.items()}
 
-VOCAB_SIZE = len(VOCAB)   # 23
+VOCAB_SIZE = len(VOCAB)  # 23
 PAD_ID = TOK2ID[PAD]
-N_ENTITIES = len(NAMES)   # 5
-N_LABELS = len(COLORS)    # 분류기 출력 크기
+N_ENTITIES = len(NAMES)  # 5
+N_LABELS = len(COLORS)  # 분류기 출력 크기
 
 assert VOCAB_SIZE == 23
 

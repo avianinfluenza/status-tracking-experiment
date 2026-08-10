@@ -13,8 +13,20 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from vocab import (NAMES, COLORS, SLOTS, TOK2ID, PAD_ID,
-                   TOPIC, CONJ, SUBJ, BALL, HAVE, SWAP, PERIOD)
+from data.vocab import (
+    NAMES,
+    COLORS,
+    SLOTS,
+    TOK2ID,
+    PAD_ID,
+    TOPIC,
+    CONJ,
+    SUBJ,
+    BALL,
+    HAVE,
+    SWAP,
+    PERIOD,
+)
 
 SLOT_IDS = [TOK2ID[s] for s in SLOTS]
 N_SLOTS = len(SLOTS)
@@ -72,14 +84,19 @@ def collate_fn(batch):
 
 
 def make_loader(path, batch_size=256, shuffle=False, num_workers=0):
-    return DataLoader(BallSwapDataset(path), batch_size=batch_size,
-                      shuffle=shuffle, num_workers=num_workers,
-                      collate_fn=collate_fn)
+    return DataLoader(
+        BallSwapDataset(path),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+    )
 
 
 if __name__ == "__main__":
     # 대충 잘 나오는지 눈으로 확인
     import sys
+
     path = sys.argv[1] if len(sys.argv) > 1 else "../data/train.jsonl"
     b = next(iter(make_loader(path, batch_size=4)))
     for k, v in b.items():

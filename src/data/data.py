@@ -13,15 +13,17 @@ import random
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from vocab import NAMES, COLORS, N_ENTITIES
+from data.vocab import NAMES, COLORS, N_ENTITIES
 
 
 @dataclass
 class GenConfig:
-    n_entities: int = 5      # 인물 수 (최대 5)
+    n_entities: int = 5  # 인물 수 (최대 5)
     min_swaps: int = 2
-    max_swaps: int = 10      # 학습이면 L_train
-    noop_ratio: float = 0.0  # 자기 자신이랑 교환하는 문장 비율. 상태는 안 바뀜 (노이즈용)
+    max_swaps: int = 10  # 학습이면 L_train
+    noop_ratio: float = (
+        0.0  # 자기 자신이랑 교환하는 문장 비율. 상태는 안 바뀜 (노이즈용)
+    )
     seed: int = 0
 
     def __post_init__(self):
@@ -103,7 +105,9 @@ def make_split(n, cfg, seen=None):
     while len(out) < n:
         tries += 1
         if tries > n * 200:
-            raise RuntimeError(f"{len(out)}/{n}에서 조합 고갈. n 줄이거나 max_swaps 늘릴 것")
+            raise RuntimeError(
+                f"{len(out)}/{n}에서 조합 고갈. n 줄이거나 max_swaps 늘릴 것"
+            )
         pr = sample_problem(rng, cfg)
         key = (tuple(pr["init_state"]), tuple(map(tuple, pr["swaps"])))
         if key in seen:
