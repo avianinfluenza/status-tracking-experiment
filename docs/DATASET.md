@@ -1,242 +1,184 @@
-# 데이터셋 설명
+# 데이터셋
 
-공 교환 상태추적 데이터셋. 뭐가 들어있고 어떻게 학습에 쓰는지 정리.
+이 레포의 데이터셋은 자연어로 서술된 공 교환 과제다. 5명의 인물이 각자
+색이 다른 공 하나를 가진 상태에서 시작하고, 여러 번의 쌍 교환을 한 뒤 최종
+상태를 예측한다.
 
-## 어떤 문제인가
+현재 구현에서 데이터 생성·검증·배치 구성은 완료되어 있으며 `src/model/`과
+`src/trainer.py`는 아직 구현 전이다. 따라서 아래의 데이터 생성과 검증 명령은
+현재 바로 사용할 수 있지만, 학습 예시는 모델 학습 코드가 완성된 뒤 연결해야
+한다.
 
-5명(윤성, 성훈, 나영, 정주, 용준)이 각자 다른 색 공(빨강, 주황, 노랑, 초록, 파랑)을
-하나씩 들고 시작한다. 둘씩 여러 번 교환한 뒤, 각자 최종적으로 무슨 색 공을 들고
-있는지 맞히는 문제.
+## 문제 정의
 
+인물과 색의 인덱스는 다음과 같이 고정되어 있다.
+
+| 인덱스 | 인물 | 색 |
+|---:|---|---|
+| 0 | 윤성 | 빨간색 |
+| 1 | 성훈 | 주황색 |
+| 2 | 나영 | 노란색 |
+| 3 | 정주 | 초록색 |
+| 4 | 용준 | 파란색 |
+
+초기 배정은 매 샘플마다 무작위 순열이고, 교환은 임의의 서로 다른 두 인물
+사이에서 일어난다. 교환 목록을 앞에서부터 실제로 적용한 결과가 정답이다.
+
+```text
+초기: 윤성=빨강, 성훈=주황, 나영=노랑, 정주=초록, 용준=파랑
+사건: 윤성과 성훈이 교환했다. 나영과 윤성이 교환했다.
+정답: 윤성=노랑, 성훈=빨강, 나영=주황, 정주=초록, 용준=파랑
 ```
-초기:  윤성=빨강, 성훈=주황, 나영=노랑, 정주=초록, 용준=파랑
-사건:  윤성과 성훈이 교환했다. 나영과 윤성이 교환했다.
-정답:  윤성=노랑, 성훈=빨강, 나영=주황, 정주=초록, 용준=파랑
+
+## 현재 제공되는 파일
+
+`data/`의 JSONL 파일은 첫 줄에 메타데이터를 포함하고, 그 다음 줄부터 샘플이
+하나씩 온다. 현재 체크인된 데이터는 다음 설정으로 생성되어 있다.
+
+| 파일 | 샘플 수 | 교환 횟수 | 시드 | 용도 |
+|---|---:|---:|---:|---|
+| `train.jsonl` | 10,000 | 2~10 | 0 | 학습 |
+| `id_test.jsonl` | 500 | 2~10 | 1000 | 학습 범위 내 평가 |
+| `ood_x4.jsonl` | 500 | 20~40 | 2004 | 길이 일반화 평가 |
+| `ood_x8.jsonl` | 500 | 40~80 | 2008 | 더 긴 길이 일반화 평가 |
+
+`train`과 `id_test`는 교환 횟수 범위는 같지만 시드가 다르다. 생성기는 두
+스플릿에 동일한 `(init, swaps)` 조합이 들어가지 않도록 중복을 제거한다.
+OOD 스플릿은 학습 범위보다 긴 교환열을 사용한다.
+
+파일 첫 줄의 예시는 다음과 같다.
+
+```json
+{"_meta":{"n_entities":5,"min_swaps":2,"max_swaps":10,"noop_ratio":0.0,"seed":0}}
 ```
 
-교환이 N번이면 상태 갱신을 N번 순서대로 따라가야 하는데, 트랜스포머는 레이어 수가
-고정이라 N이 커지면 한 번의 forward pass 안에서 못 따라간다. 어디서 무너지는지,
-그리고 같은 블록을 반복해서 도는 recurrent 구조가 그걸 얼마나 버텨주는지 보는 게
-이 실험의 목적.
+`BallSwapDataset`은 이 줄을 `dataset.meta`로 읽고 샘플에서는 제외한다.
 
-## 파일
-
-`data/` 안에 4개. 전부 jsonl이고 한 줄이 문제 하나다.
-
-| 파일 | 샘플 수 | 교환 횟수 | 용도 |
-|---|---|---|---|
-| `train.jsonl` | 10,000 | 2~10회 | 학습 |
-| `id_test.jsonl` | 500 | 2~10회 | 평가. 학습과 같은 조건, 다른 시드 |
-| `ood_x4.jsonl` | 500 | 20~40회 | 평가. 학습보다 훨씬 긴 교환 |
-| `ood_x8.jsonl` | 500 | 40~80회 | 평가. 더 긴 버전 |
-
-학습 때 본 적 없는 길이에서 어떻게 되는지(ood 두 개)가 실험의 핵심이다.
-
-**각 파일의 첫 줄은 데이터가 아니라 생성 설정 기록**이다. 직접 읽을 일이 있으면
-첫 줄은 건너뛸 것 (아래 로더는 알아서 처리한다).
-
-## 샘플 구조
-
-파일에는 문제의 원본만 들어 있다. 토큰이나 패딩 없음.
+## 원본 샘플 형식
 
 ```json
 {
-  "text":    "윤성은 노란색 공을 가지고 있다. ... 나영과 정주가 공을 교환했다. ...",
-  "init":    [2, 1, 0, 4, 3],       // 사람i가 처음 가진 색 인덱스
-  "swaps":   [[2, 3], [1, 4]],      // 교환 쌍, 사건 순서대로
-  "labels":  [0, 3, 4, 1, 2],       // 각 인물의 최종 공 색 (정답)
-  "n_swaps": 2                      // 교환 횟수. 결과 분석할 때 씀
+  "text": "윤성은 노란색 공을 가지고 있다. ...",
+  "init": [2, 1, 0, 4, 3],
+  "swaps": [[2, 3], [1, 4]],
+  "labels": [0, 3, 4, 1, 2],
+  "n_swaps": 2
 }
 ```
 
-- 사람 인덱스: 윤성=0, 성훈=1, 나영=2, 정주=3, 용준=4
-- 색 인덱스: 빨간색=0, 주황색=1, 노란색=2, 초록색=3, 파란색=4
-- `labels[0]=2`면 윤성의 최종 공이 노란색이라는 뜻
-- `text`는 사람 읽으라고 넣은 필드. init/swaps에서 자동으로 만들어지는 거라
-  토큰 데이터와 어긋날 일은 없고, 학습에는 안 쓴다
+- `init[i]`: 인물 `i`가 처음 가진 색의 인덱스
+- `swaps`: 교환할 인물 쌍의 목록. 저장 시 튜플이 아니라 `[a, b]` 배열이다.
+- `labels[i]`: 모든 교환 후 인물 `i`가 가진 색의 인덱스
+- `n_swaps`: 교환 사건 수. 길이별 평가·분석에 사용한다.
+- `text`: 사람이 읽기 위한 자연어 표현. 학습 입력은 이 문자열을 직접 토큰화하지 않고 `init`과 `swaps`에서 재구성한다.
 
-토큰화는 학습 시점에 `src/collate.py`가 한다. 시퀀스는 이렇게 조립된다:
+생성기의 `n_entities`를 5보다 작게 설정할 수도 있다. 이 경우 `init`, `labels`,
+`text`에는 실제 인물 수만 들어가고, 배치 라벨의 남는 슬롯은 `-100`이 된다.
 
-```
-[윤성] [은] [빨간색] [공을] [가지고 있다] [.]      초기 배정 5문장 (6토큰씩)
-...
-[윤성] [과] [성훈] [이] [공을] [교환했다] [.]      교환 N문장 (7토큰씩)
-...
-[PAD] [PAD] ...                                  배치 내 최장 샘플에 맞춰 채움
-[SLOT_윤성] [SLOT_성훈] [SLOT_나영] [SLOT_정주] [SLOT_용준]
-```
+## 토큰화와 배치 구성
 
-SLOT 토큰이 맨 끝에 오도록 PAD를 그 앞에 넣는다. 이러면 SLOT 위치가 배치 안에서
-전부 같아져서 hidden state 뽑기가 gather 한 번으로 끝난다. 대신 PAD가 시퀀스
-중간에 끼니까 attn_mask를 모델에 꼭 넘겨야 한다.
+고정 어휘는 `src/data/vocab.py`에 정의되어 있으며 총 23개다. 어휘의 순서가
+토큰 ID이므로 기존 데이터나 체크포인트와 함께 사용할 때 순서를 바꾸면 안 된다.
 
-vocab은 딱 23개고 `src/vocab.py`에 있다. **토큰 순서를 바꾸면 다 꼬이니까
-건드리지 말 것.**
+`src/data/collate.py`의 `encode_body()`는 문자열 `text`가 아니라 구조화된
+`init`과 `swaps`를 다음 고정 토큰열로 바꾼다.
 
-## 학습시키는 법
-
-### 1. 로더 만들기
-
-```python
-import sys; sys.path.append("src")   # 프로젝트 루트에서 돌릴 때
-from collate import make_loader
-
-train_loader = make_loader("data/train.jsonl", batch_size=256, shuffle=True)
+```text
+초기 배정 1개: [이름] [은] [색] [공을] [가지고 있다] [.]   (6토큰)
+교환 1개:     [이름] [과] [이름] [이] [공을] [교환했다] [.] (7토큰)
 ```
 
-collate_fn이 이미 붙어 있어서 이거면 끝이다. 배치는 dict 하나로 나온다:
+배치에서는 가장 긴 본문 뒤에 짧은 샘플만 `[PAD]`를 넣고, 모든 샘플의 끝에
+5개의 슬롯 토큰을 붙인다.
 
-| 키 | shape | 내용 |
+```text
+[초기 배정 ...] [교환 ...] [PAD ...] [SLOT_윤성] ... [SLOT_용준]
+```
+
+본문 길이는 `6 * n_entities + 7 * n_swaps`이고, 배치 입력 길이는
+`max_body_length + 5`다. 따라서 현재 기본 데이터의 최대 길이는 학습 105,
+`ood_x4` 315, `ood_x8` 595 토큰이다. 슬롯 위치는 배치마다 동일하지만, 본문
+앞쪽에 패딩이 있을 수 있으므로 모델은 반드시 `attn_mask`를 사용해야 한다.
+
+`collate_fn()`이 반환하는 배치는 다음 dict다.
+
+| 키 | shape | 설명 |
 |---|---|---|
-| `input_ids` | [B, L] | 토큰 ID. L은 배치마다 다름 (배치 내 최장 기준) |
-| `attn_mask` | [B, L] | 1=실제 토큰, 0=PAD |
-| `slot_pos` | [B, 5] | SLOT 토큰 5개의 위치 (배치 안에서는 전부 동일) |
-| `labels` | [B, 5] | 각 인물의 최종 공 색. -100이면 그 칸은 무시 |
+| `input_ids` | `[B, L]` | 토큰 ID |
+| `attn_mask` | `[B, L]` | 실제 토큰/슬롯은 1, PAD는 0 |
+| `slot_pos` | `[B, 5]` | 5개 슬롯 토큰의 위치 |
+| `labels` | `[B, 5]` | 색 ID. 사용하지 않는 슬롯은 -100 |
 
-### 2. 모델이 지켜야 할 것
+## 로더 사용
 
-모델 구조는 자유인데 (그게 실험이니까) 입출력 규약 두 가지만 맞추면 된다.
-
-1. `forward(input_ids, attn_mask)` 형태로 받고, `attn_mask`가 0인 위치는
-   attention에서 빼야 한다. `nn.TransformerEncoder` 기준으로는
-   `src_key_padding_mask=(attn_mask == 0)` 넘기면 된다.
-2. 출력은 전체 위치의 hidden state `[B, L, D]`. 슬롯 뽑기랑 분류는 밖에서 한다.
-
-위치 임베딩은 신경 써서 정해야 한다. 배치마다 L이 다르고, ood 파일은 학습(최대
-105)보다 훨씬 길어서(최대 595), **학습형 absolute embedding을 쓰면 ood는 아예
-돌릴 수가 없다.** sinusoidal이나 RoPE처럼 길이에 안 묶이는 걸 쓰거나, 최소한
-ood 최대 길이만큼 미리 잡아두거나. 어느 쪽이든 vanilla랑 recurrent가 같은 걸
-써야 공정한 비교가 된다.
-
-### 3. 학습 루프
-
-```python
-import torch
-import torch.nn.functional as F
-from collate import make_loader
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = MyModel(vocab_size=23).to(device)        # 모델은 각자 구현
-classifier = torch.nn.Linear(D_MODEL, 5).to(device)  # 5색 분류. 슬롯 5개가 공유
-
-opt = torch.optim.AdamW(
-    list(model.parameters()) + list(classifier.parameters()), lr=3e-4)
-
-train_loader = make_loader("data/train.jsonl", batch_size=256, shuffle=True)
-
-for epoch in range(30):
-    model.train()
-    for batch in train_loader:
-        batch = {k: v.to(device) for k, v in batch.items()}
-
-        hidden = model(batch["input_ids"], batch["attn_mask"])   # [B, L, D]
-
-        # 슬롯 위치 hidden state만 뽑기 -> [B, 5, D]
-        idx = batch["slot_pos"].unsqueeze(-1).expand(-1, -1, hidden.size(-1))
-        slots = hidden.gather(1, idx)
-
-        logits = classifier(slots)                               # [B, 5, 5]
-
-        # 슬롯 5개 각각 cross entropy, 합쳐서 역전파. -100 칸은 자동 무시
-        loss = F.cross_entropy(logits.reshape(-1, 5),
-                               batch["labels"].reshape(-1),
-                               ignore_index=-100)
-
-        opt.zero_grad()
-        loss.backward()
-        opt.step()
-```
-
-시작점으로 쓸만한 설정: d_model 128, head 4, FFN 512, layer 4 (vanilla 기준),
-batch 256, lr 3e-4, 30 epoch. 문제가 작아서 GPU 없어도 돌아간다.
-과적합 걱정은 별로 없는 과제라 dropout은 0이어도 무방하다.
-
-### 4. 평가
-
-```python
-@torch.no_grad()
-def evaluate(model, classifier, path):
-    model.eval()
-    loader = make_loader(path, batch_size=256)
-    n_exact = n_total = 0
-    by_swaps = {}   # 교환 횟수별 집계
-
-    for batch in loader:
-        # n_swaps는 텐서에 없으니 원본에서 같이 뽑아야 함. 아래 참고
-        batch_gpu = {k: v.to(device) for k, v in batch.items()}
-        hidden = model(batch_gpu["input_ids"], batch_gpu["attn_mask"])
-        idx = batch_gpu["slot_pos"].unsqueeze(-1).expand(-1, -1, hidden.size(-1))
-        logits = classifier(hidden.gather(1, idx))
-        pred = logits.argmax(-1).cpu()                    # [B, 5]
-
-        valid = batch["labels"] != -100
-        hit = ((pred == batch["labels"]) | ~valid).all(dim=1)  # 샘플별 전부 정답?
-        n_exact += hit.sum().item()
-        n_total += len(hit)
-
-    return n_exact / n_total
-
-for split in ["id_test", "ood_x4", "ood_x8"]:
-    print(split, evaluate(model, classifier, f"data/{split}.jsonl"))
-```
-
-지표는 **exact match**(5칸 전부 정답인 샘플 비율)로 통일하자. 슬롯 단위 정확도는
-찍어도 점수가 나와서 모델이 무너진 걸 가려버린다.
-
-결과 그림은 교환 횟수별로 쪼개서 그리는 게 제일 잘 보인다. `n_swaps`가 배치
-텐서에는 안 들어가니까, 분석할 때는 Dataset에서 직접 뽑으면 된다:
-
-```python
-from collate import BallSwapDataset, collate_fn
-
-ds = BallSwapDataset("data/ood_x8.jsonl")
-# 샘플 하나씩 돌리면서 (ds[i]["n_swaps"], 맞았는지) 쌓기
-rows = [collate_fn([ds[i]]) for i in range(len(ds))]   # 배치 크기 1
-```
-
-x축 교환 횟수, y축 exact match로 vanilla와 recurrent를 겹쳐 그리면
-"어디서 무너지는가"가 그래프 하나로 정리된다. 이게 사실상 최종 발표의 메인 그림.
-
-### 5. 비교 실험할 때 주의
-
-- vanilla와 recurrent는 **위치 임베딩, d_model, head 수, lr, epoch을 전부 똑같이**
-  두고 구조만 달라야 한다. 하나라도 다르면 결과 차이가 구조 때문인지 설정 때문인지
-  말할 수 없게 된다.
-- 시드 최소 3개(예: 0, 1, 2)로 돌려서 평균±편차로 보고할 것. 작은 모델은 시드빨이
-  꽤 세다.
-- 비교 짝은 두 가지를 다 보는 게 좋다: 유효 깊이를 맞춘 것(vanilla 4층 vs 반복 4회)과
-  파라미터 수를 맞춘 것(vanilla 1층 vs 반복 4회). 전자는 "같은 계산량", 후자는
-  "같은 크기" 비교라 서로 다른 걸 말해준다.
-
-## 데이터가 보장하는 것
-
-- 초기 색 배정은 매번 무작위 순열 → "윤성은 늘 빨강" 같은 지름길 없음
-- 모든 스플릿에서 같은 문제가 두 번 안 나옴 (train/test 겹침도 없음)
-- 정답은 교환을 실제로 시뮬레이션해서 계산. `src/verify.py`가 토큰 시퀀스만 다시
-  파싱해서 독립적으로 재계산해 대조함
-- 5색 라벨이 정확히 균등 → 다수 클래스 찍기 불가능
-- 교환 쌍은 임의의 두 명 (인접 제한 없음)
-
-## 재생성
-
-같은 시드면 같은 데이터가 나온다. 파일 대신 명령어를 공유하면 된다.
+패키지 import 경로가 `data.*`이므로 프로젝트 루트가 아니라 `src/`에서 실행한다.
 
 ```bash
 cd src
-python verify.py                              # 검증. 재생성 전후로 꼭 실행
-python data.py --n-train 10000 --n-test 500   # 지금 data/와 동일
+python -m data.verify
+python -m data.collate ../data/train.jsonl
 ```
 
-실험 바꿀 때 쓰는 옵션:
+Python 코드에서는 다음처럼 사용한다.
 
-| 옵션 | 효과 |
-|---|---|
-| `--n-train 50000` | 학습 데이터 늘리기 |
-| `--l-train 20` | 학습 교환 횟수 상한 변경 |
-| `--ood-mult 4 8 16` | ood 스플릿 추가 |
-| `--n-entities 3` | 인물 수 줄이기 |
-| `--noop-ratio 0.3` | 상태 안 바뀌는 교환 문장 섞기 (노이즈) |
-| `--seed 1` | 시드 변경 |
+```python
+from data.collate import BallSwapDataset, make_loader
 
-`data/`에 있는 건 기본 설정(seed 0)으로 만든 예시 데이터셋이다. 시드가 같으면
-항상 같은 데이터가 나오니까, 조건 바꾼 데이터는 파일 말고 명령어로 공유하자.
+dataset = BallSwapDataset("../data/train.jsonl")
+print(dataset.meta)
+loader = make_loader("../data/train.jsonl", batch_size=256, shuffle=True)
+batch = next(iter(loader))
+```
+
+`n_swaps`와 원본 `text`는 collate 결과에 포함되지 않는다. 길이별 평가가 필요하면
+`BallSwapDataset`의 원본 샘플을 별도로 읽어 `n_swaps`를 예측 결과와 함께
+기록한다.
+
+## 데이터 검증
+
+검증기는 생성기와 별도의 경로로 collate된 토큰을 다시 파싱하고, 교환을
+재시뮬레이션해 `labels`와 대조한다. 또한 PAD mask, 슬롯 위치, 자연어 `text`의
+순서, 라벨 분포를 검사한다.
+
+```bash
+cd src
+python -m data.verify
+```
+
+성공하면 여러 설정에 대한 `OK` 메시지와 마지막의 `전부 통과`가 출력된다.
+데이터를 새로 만들었거나 `src/data/collate.py`를 수정했다면 이 검증을 먼저
+실행한다.
+
+## 데이터 재생성
+
+기본값으로 현재 데이터와 같은 조건의 파일을 다시 만들 수 있다. 출력 경로의
+기본값은 `../data`이므로 `src/`에서 실행한다.
+
+```bash
+cd src
+python -m data.data --n-train 10000 --n-test 500
+```
+
+생성기 주요 옵션은 다음과 같다.
+
+| 옵션 | 기본값 | 설명 |
+|---|---:|---|
+| `--out` | `../data` | JSONL 출력 디렉터리 |
+| `--n-train` | 10000 | 학습 샘플 수 |
+| `--n-test` | 500 | `id_test`와 각 OOD 샘플 수 |
+| `--n-entities` | 5 | 사용할 인물 수 (2~5) |
+| `--l-train` | 10 | 학습/ID 교환 횟수 상한 |
+| `--ood-mult` | `4 8` | OOD 배수 목록 |
+| `--noop-ratio` | 0.0 | 자기 자신과의 교환 비율. 상태는 바뀌지 않음 |
+| `--seed` | 0 | 기본 생성 시드 |
+
+예를 들어 학습 범위를 20회까지 늘리고 OOD 배수 4, 8, 16을 추가하려면 다음과
+같이 실행한다.
+
+```bash
+cd src
+python -m data.data --l-train 20 --ood-mult 4 8 16
+```
+
+재생성 시 같은 출력 파일을 덮어쓰므로, 기존 데이터가 필요하면 먼저 별도
+디렉터리를 `--out`으로 지정한다.
