@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 체크포인트는 올리지 말 것. 순식간에 수백 MB 된다
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+wandb/
+lightning_logs/
+.ipynb_checkpoints/
+.DS_Store
