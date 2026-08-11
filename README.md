@@ -11,7 +11,10 @@ Transformer가 일반 Transformer보다 우위를 보이는가?
 자원으로 사용되는지를 실험적으로 검증한다.
 
 주 실험의 가설–코드 대응과 해석 기준은 [RESEARCH_DESIGN.md](RESEARCH_DESIGN.md),
-기존 ball-swap 데이터 형식은 [DATASET.md](DATASET.md) 참고.
+기존 ball-swap 데이터 형식은 [DATASET.md](DATASET.md) 참고. 팀의 초기 합의안을
+그대로 재현하는 별도 실행 경로는 [ORIGINAL_PLAN.md](ORIGINAL_PLAN.md)에 있다.
+이번 모델 작업의 배경, 변경 범위, 검증 상태와 다음 작업은
+[MODEL_DESIGN_HANDOFF.md](MODEL_DESIGN_HANDOFF.md)에 정리했다.
 
 ## 비교 대상
 
@@ -31,6 +34,7 @@ Transformer가 일반 Transformer보다 우위를 보이는가?
 data/    train / id_test / ood_x4 / ood_x8 (jsonl, 예시 데이터셋 포함)
 src/
 ├── systematic/  target depth와 distractor를 독립 통제하는 주 연구 파이프라인
+├── original/    초기 팀 스코프(Direct/Explicit CoT/Recurrent) 재현 경로
 ├── vocab.py     고정 vocab 23개 (건드리지 말 것)
 ├── data.py      데이터 생성기
 ├── collate.py   Dataset + collate_fn (토큰화/패딩/SLOT 부착)
@@ -82,6 +86,17 @@ adaptive halting은 주 조건과 섞지 않고 각각 ablation으로 보고한�
 python scripts/run_systematic_experiments.py --smoke
 python scripts/run_systematic_experiments.py --architecture standard --num-layers 6 --seed 0
 python scripts/run_systematic_experiments.py --architecture recurrent --train-loops 6 --seed 0
+```
+
+확장안 채택 여부와 무관하게 원래 팀 설계를 실행할 수 있다. 이 경로는 5명 전체
+상태, 총 swap length 기준 ID/OOD, Sinusoidal/RoPE 선택, `h=e+block(h)`,
+출력 KL-only halting을 고정한다.
+
+```bash
+python scripts/run_original_experiments.py --architecture direct --smoke --device cpu
+python scripts/run_original_experiments.py --architecture cot --smoke --device cpu
+python scripts/run_original_experiments.py --architecture recurrent --smoke --device cpu \
+  --adaptive-kl-eval
 ```
 
 빠른 smoke test:
