@@ -4,13 +4,20 @@
 # 교환을 처음부터 재시뮬레이션한 다음, 저장된 labels랑 맞는지 대조한다.
 # 생성기가 정답을 잘못 계산했으면 여기서 걸린다.
 #
-#   python verify.py    (torch 필요)
+#   python -m src.data.verify    (torch 필요)
 
 import random
 
-from data.vocab import NAMES, COLORS, SLOTS, ID2TOK, PAD, PAD_ID, TOPIC, decode
-from data.data import GenConfig, sample_problem, to_row, josa
-from data.collate import collate_fn, SLOT_IDS
+try:  # module-style and script-style execution 둘 다 지원
+    from .vocab import (NAMES, COLORS, SLOTS, ID2TOK, PAD, PAD_ID,
+                        TOPIC, decode)
+    from .data import GenConfig, sample_problem, to_row, josa
+    from .collate import collate_fn, SLOT_IDS
+except ImportError:  # pragma: no cover
+    from vocab import (NAMES, COLORS, SLOTS, ID2TOK, PAD, PAD_ID,
+                       TOPIC, decode)
+    from data import GenConfig, sample_problem, to_row, josa
+    from collate import collate_fn, SLOT_IDS
 
 NAME_SET = set(NAMES)
 
@@ -72,24 +79,18 @@ def check_batch(cfg, seed, n=64):
                 want = COLORS.index(final[NAMES[j]])
             else:
                 want = -100
-            assert (
-                labels[j] == want
-            ), f"sample {i} slot {j}: labels={labels[j]} 재계산={want}\n" + decode(
-                ids, strip_pad=True
-            )
+            assert labels[j] == want, (
+                f"sample {i} slot {j}: labels={labels[j]} 재계산={want}\n"
+                + decode(ids, strip_pad=True))
 
         # text 필드가 구조 데이터랑 맞는 순서로 나오는지
         pos = -1
-        frags = [
-            f"{NAMES[j]}{josa(NAMES[j], '은', '는')} "
-            f"{COLORS[p['init_state'][j]]} 공을"
-            for j in range(cfg.n_entities)
-        ]
-        frags += [
-            f"{NAMES[a]}{josa(NAMES[a], '과', '와')} "
-            f"{NAMES[b]}{josa(NAMES[b], '이', '가')} 공을 교환했다"
-            for a, b in p["swaps"]
-        ]
+        frags = [f"{NAMES[j]}{josa(NAMES[j], '은', '는')} "
+                 f"{COLORS[p['init_state'][j]]} 공을"
+                 for j in range(cfg.n_entities)]
+        frags += [f"{NAMES[a]}{josa(NAMES[a], '과', '와')} "
+                  f"{NAMES[b]}{josa(NAMES[b], '이', '가')} 공을 교환했다"
+                  for a, b in p["swaps"]]
         for fr in frags:
             nxt = row["text"].find(fr, pos + 1)
             assert nxt > pos, f"text에서 못 찾음: {fr}"

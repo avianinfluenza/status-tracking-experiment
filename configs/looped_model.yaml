@@ -1,0 +1,34 @@
+# Weight-tied Looped/Recurrent Transformer for the ball-swap task.
+architecture: recurrent
+position_encoding: sinusoidal  # ablation: rope
+d_model: 128
+n_heads: 4
+d_ff: 512
+dropout: 0.0
+num_loops: 6
+classifier_dim: 2
+update: h = e + block(h)
+
+adaptive_halting:
+  enabled_at_evaluation: true
+  signal: output_symmetric_kl_only
+  threshold: 0.001
+  min_loops: 2
+  patience: 1
+
+ablations:
+  deep_supervision_weight: 0.0
+  noop_eval_ratio: 0.0
+
+training:
+  epochs: 30
+  batch_size: 128
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  seeds: [0, 1, 2]
+
+evaluation:
+  splits: [id_test, ood_x4, ood_x8]
+  metrics: [slot_accuracy, exact_match, exact_match_by_swaps]

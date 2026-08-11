@@ -4,10 +4,8 @@
 색이 다른 공 하나를 가진 상태에서 시작하고, 여러 번의 쌍 교환을 한 뒤 최종
 상태를 예측한다.
 
-현재 구현에서 데이터 생성·검증·배치 구성은 완료되어 있으며 `src/model/`과
-`src/trainer.py`는 아직 구현 전이다. 따라서 아래의 데이터 생성과 검증 명령은
-현재 바로 사용할 수 있지만, 학습 예시는 모델 학습 코드가 완성된 뒤 연결해야
-한다.
+데이터 생성·검증·배치 구성과 `src/model/`, `src/trainer.py` 연결까지 구현되어
+있다. 아래 명령은 프로젝트 루트에서 실행한다.
 
 ## 문제 정의
 
@@ -108,31 +106,28 @@ OOD 스플릿은 학습 범위보다 긴 교환열을 사용한다.
 | `attn_mask` | `[B, L]` | 실제 토큰/슬롯은 1, PAD는 0 |
 | `slot_pos` | `[B, 5]` | 5개 슬롯 토큰의 위치 |
 | `labels` | `[B, 5]` | 색 ID. 사용하지 않는 슬롯은 -100 |
+| `n_swaps` | `[B]` | 교환 횟수. 길이별 exact match 집계에 사용 |
 
 ## 로더 사용
 
-패키지 import 경로가 `data.*`이므로 프로젝트 루트가 아니라 `src/`에서 실행한다.
-
 ```bash
-cd src
-python -m data.verify
-python -m data.collate ../data/train.jsonl
+python -m src.data.verify
+python -m src.data.collate data/train.jsonl
 ```
 
 Python 코드에서는 다음처럼 사용한다.
 
 ```python
-from data.collate import BallSwapDataset, make_loader
+from src.data.collate import BallSwapDataset, make_loader
 
-dataset = BallSwapDataset("../data/train.jsonl")
+dataset = BallSwapDataset("data/train.jsonl")
 print(dataset.meta)
-loader = make_loader("../data/train.jsonl", batch_size=256, shuffle=True)
+loader = make_loader("data/train.jsonl", batch_size=256, shuffle=True)
 batch = next(iter(loader))
 ```
 
-`n_swaps`와 원본 `text`는 collate 결과에 포함되지 않는다. 길이별 평가가 필요하면
-`BallSwapDataset`의 원본 샘플을 별도로 읽어 `n_swaps`를 예측 결과와 함께
-기록한다.
+원본 `text`는 collate 결과에 포함되지 않지만 `n_swaps`는 배치에 보존되므로
+예측 결과를 교환 횟수별로 바로 집계할 수 있다.
 
 ## 데이터 검증
 
@@ -141,8 +136,7 @@ batch = next(iter(loader))
 순서, 라벨 분포를 검사한다.
 
 ```bash
-cd src
-python -m data.verify
+python -m src.data.verify
 ```
 
 성공하면 여러 설정에 대한 `OK` 메시지와 마지막의 `전부 통과`가 출력된다.
@@ -151,12 +145,11 @@ python -m data.verify
 
 ## 데이터 재생성
 
-기본값으로 현재 데이터와 같은 조건의 파일을 다시 만들 수 있다. 출력 경로의
-기본값은 `../data`이므로 `src/`에서 실행한다.
+기본값으로 현재 데이터와 같은 조건의 파일을 다시 만들 수 있다. 기존 파일을
+덮어쓸 수 있으므로 출력 경로를 명시한다.
 
 ```bash
-cd src
-python -m data.data --n-train 10000 --n-test 500
+python -m src.data.data --out data --n-train 10000 --n-test 500
 ```
 
 생성기 주요 옵션은 다음과 같다.
@@ -176,8 +169,7 @@ python -m data.data --n-train 10000 --n-test 500
 같이 실행한다.
 
 ```bash
-cd src
-python -m data.data --l-train 20 --ood-mult 4 8 16
+python -m src.data.data --out data-v2 --l-train 20 --ood-mult 4 8 16
 ```
 
 재생성 시 같은 출력 파일을 덮어쓰므로, 기존 데이터가 필요하면 먼저 별도

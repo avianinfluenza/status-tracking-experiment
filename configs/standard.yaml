@@ -1,0 +1,7 @@
+architecture: standard
+d_model: 128
+n_heads: 4
+d_ff: 512
+num_layers: 6
+dropout: 0.0
+num_locations: 8

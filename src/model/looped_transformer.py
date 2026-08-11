@@ -1,7 +1,8 @@
-import torch
-import torch.nn as nn
+"""Team-facing import for the completed Looped/Recurrent Transformer."""
+
+from ..original.model import RecurrentTransformer
 
 
-class LoopedTransformer(nn.Module):
-    def __init__(self):
-        super().__init__()
+LoopedTransformer = RecurrentTransformer
+
+__all__ = ["LoopedTransformer", "RecurrentTransformer"]

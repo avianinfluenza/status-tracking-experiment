@@ -1,0 +1,50 @@
+# Reference configuration for the team's original experiment scope.
+data:
+  n_entities: 5
+  train_swap_length: [2, 10]
+  id_swap_length: [2, 10]
+  ood_x4_swap_length: [20, 40]
+  ood_x8_swap_length: [40, 80]
+  output: all_5_final_colors
+
+shared_model:
+  d_model: 128
+  n_heads: 4
+  d_ff: 512
+  dropout: 0.0
+  position_encoding: sinusoidal  # change to rope for the PE comparison
+
+direct:
+  num_layers: 6
+
+explicit_cot:
+  num_layers: 6
+  trace: full_5_person_state_after_each_swap
+  train: teacher_forced_color_tokens
+  evaluation: autoregressive_trace_generation
+
+recurrent:
+  num_loops: 6
+  update: h = e + block(h)
+  adaptive_halting:
+    signal: output_symmetric_kl_only
+    threshold: 0.001
+    min_loops: 2
+    patience: 1
+  ablations:
+    deep_supervision_weight: 0.0
+    noop_eval_ratio: 0.0
+
+training:
+  epochs: 30
+  batch_size: 128
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  seeds: [0, 1, 2]
+
+analysis:
+  aggregate: scripts/aggregate_original_results.py
+  plot: scripts/plot_original_results.py
+  multiseed_runner: scripts/run_original_multiseed.py

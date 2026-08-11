@@ -13,20 +13,12 @@ from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from data.vocab import (
-    NAMES,
-    COLORS,
-    SLOTS,
-    TOK2ID,
-    PAD_ID,
-    TOPIC,
-    CONJ,
-    SUBJ,
-    BALL,
-    HAVE,
-    SWAP,
-    PERIOD,
-)
+try:  # module-style and script-style execution 둘 다 지원
+    from .vocab import (NAMES, COLORS, SLOTS, TOK2ID, PAD_ID,
+                        TOPIC, CONJ, SUBJ, BALL, HAVE, SWAP, PERIOD)
+except ImportError:  # pragma: no cover
+    from vocab import (NAMES, COLORS, SLOTS, TOK2ID, PAD_ID,
+                       TOPIC, CONJ, SUBJ, BALL, HAVE, SWAP, PERIOD)
 
 SLOT_IDS = [TOK2ID[s] for s in SLOTS]
 N_SLOTS = len(SLOTS)
@@ -80,23 +72,20 @@ def collate_fn(batch):
         "attn_mask": torch.tensor(attn_mask, dtype=torch.long),
         "slot_pos": torch.tensor([slot_pos] * len(batch), dtype=torch.long),
         "labels": torch.tensor(labels, dtype=torch.long),
+        # 평가 때 교환 횟수별 exact match를 바로 집계할 수 있게 보존한다.
+        "n_swaps": torch.tensor([r["n_swaps"] for r in batch], dtype=torch.long),
     }
 
 
 def make_loader(path, batch_size=256, shuffle=False, num_workers=0):
-    return DataLoader(
-        BallSwapDataset(path),
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=collate_fn,
-    )
+    return DataLoader(BallSwapDataset(path), batch_size=batch_size,
+                      shuffle=shuffle, num_workers=num_workers,
+                      collate_fn=collate_fn)
 
 
 if __name__ == "__main__":
     # 대충 잘 나오는지 눈으로 확인
     import sys
-
     path = sys.argv[1] if len(sys.argv) > 1 else "../data/train.jsonl"
     b = next(iter(make_loader(path, batch_size=4)))
     for k, v in b.items():
