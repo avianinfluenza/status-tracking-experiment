@@ -1,7 +1,4 @@
-# Original team-plan experiment track
-
-이 경로는 확장 연구안(`src/systematic/`)을 대체하지 않는다. 팀이 처음 합의한
-스코프를 동일 저장소에서 독립적으로 실행해 결과를 비교할 수 있게 보존한다.
+# 모델 설계 및 실험 계획
 
 ## 고정된 연구 범위
 
@@ -28,9 +25,8 @@ Explicit CoT는 각 교환 다음에 아래처럼 전체 상태를 쓴다.
 
 학습 때는 gold trace를 teacher forcing으로 사용하지만 loss는 각 SLOT 다음의 색
 예측에만 적용한다. 평가는 gold 중간 상태를 제공하지 않고 색 토큰을
-autoregressive하게 생성한다. 따라서 CoT 조건의 중간 정답 누수를 막는다. 긴 OOD
-trace 평가는 layer별 attention K/V cache를 사용해 이미 처리한 prefix를 다시
-계산하지 않는다.
+autoregressive하게 생성한다. 긴 OOD trace 평가는 layer별 attention K/V cache를
+사용해 이미 처리한 prefix를 다시 계산하지 않는다.
 
 ## 실행
 
@@ -49,7 +45,7 @@ python scripts/run_original_experiments.py --architecture cot \
 python scripts/run_original_experiments.py --architecture recurrent \
   --position-encoding sinusoidal --adaptive-kl-eval --seed 0
 
-# PE ablation은 동일 명령에서 rope로만 변경
+# 위치 표현 비교는 동일 조건에서 rope로만 변경
 python scripts/run_original_experiments.py --architecture recurrent \
   --position-encoding rope --adaptive-kl-eval --seed 0
 ```
@@ -59,7 +55,7 @@ python scripts/run_original_experiments.py --architecture recurrent \
 Recurrent adaptive 평가에는 평균 loop 수, halt rate, 마지막 symmetric KL도
 기록한다.
 
-3개 seed의 Basic/Looped 비교와 집계는 한 명령으로 실행한다.
+3개 seed의 Basic/Looped 비교와 집계:
 
 ```bash
 python scripts/run_original_multiseed.py --seeds 0 1 2 \
@@ -68,16 +64,11 @@ python scripts/plot_original_results.py runs/original/aggregate/summary.csv \
   --output-dir runs/original/figures
 ```
 
-Deep supervision과 noop robustness는 주 조건과 분리한 선택형 ablation이다.
+Deep supervision과 noop robustness는 기본 비교와 분리한 선택형 ablation이다.
 
 ```bash
 python main.py --architecture recurrent --deep-supervision-weight 0.5 \
   --noop-eval-ratio 0.5 --adaptive-kl-eval
 ```
 
-## 해석 시 주의
-
-이 경로에서 `swap length`는 context length와 state-transition depth를 분리하지
-않는다. 따라서 길이 OOD 성능 차이는 원래 팀 질문에는 답하지만, systematic state
-updating 자체의 증거로 단정할 수는 없다. 그 통제 실험은 `src/systematic/`의
-target-depth/distractor 분리 경로에서 수행한다.
+본 결과에는 `--smoke`를 제거하고 최소 3개 seed의 평균과 표준편차를 보고한다.

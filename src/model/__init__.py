@@ -1,19 +1,10 @@
-"""Model package for shared classifiers and state-tracking Transformers."""
+"""Shared model components for the ball-swap experiment.
+
+Import Basic and Looped models from ``basic_transformer`` and
+``looped_transformer`` respectively.  Keeping those imports out of this module
+avoids a cycle while the implementations use the shared classifier.
+"""
 
 from .classifier import Classifier
-from .state_tracking import (
-    ModelConfig,
-    RecurrentTransformerEncoder,
-    StateTrackingModel,
-    VanillaTransformerEncoder,
-    count_parameters,
-)
 
-__all__ = [
-    "Classifier",
-    "ModelConfig",
-    "RecurrentTransformerEncoder",
-    "StateTrackingModel",
-    "VanillaTransformerEncoder",
-    "count_parameters",
-]
+__all__ = ["Classifier"]
