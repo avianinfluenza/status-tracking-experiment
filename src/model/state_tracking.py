@@ -18,12 +18,8 @@ from typing import Literal
 import torch
 from torch import Tensor, nn
 
-try:  # Support both ``python -m src.train`` and ``python src/train.py``.
-    from .classifier import Classifier
-    from .vocab import N_LABELS, PAD_ID, VOCAB_SIZE
-except ImportError:  # pragma: no cover - exercised by script-style execution.
-    from classifier import Classifier
-    from vocab import N_LABELS, PAD_ID, VOCAB_SIZE
+from .classifier import Classifier
+from ..data.vocab import N_LABELS, PAD_ID, VOCAB_SIZE
 
 
 ModelType = Literal["vanilla", "recurrent"]

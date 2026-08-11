@@ -19,6 +19,18 @@
 | CoT/teacher forcing | 누수 없는 autoregressive Explicit CoT 평가 |
 | noop 강건성 | `--noop-eval-ratio`로 gold-preserving self-swap 평가 |
 
+## 새 저장소 구조와의 통합
+
+최신 `main`의 패키지 구성을 기준으로 데이터 코드는 `src/data/`, 모델 코드는
+`src/model/`에 배치했다. 기존 모델 구현은 `src/model/state_tracking.py`에 보존하고,
+팀 공통 import 경로인 `src/model/basic_transformer.py`와
+`src/model/looped_transformer.py`에서 각각 Basic/Looped 구현을 노출한다.
+
+루트 `main.py`는 두 실행 방식을 함께 지원한다. `--config`가 있으면
+`src/trainer.py`가 팀 YAML 설정을 기존 실험 실행기의 인자로 변환하고, 없으면 기존
+직접 CLI를 그대로 사용한다. 따라서 새 구조를 따르면서도 기존 실험 명령과 결과
+형식을 유지한다.
+
 ## 모델 구조
 
 ### Basic/Direct
@@ -71,6 +83,13 @@ cached decoding이 전체 causal forward와 같은 출력을 내는지 테스트
 python main.py --architecture direct --seed 0
 python main.py --architecture recurrent --seed 0 --adaptive-kl-eval
 python main.py --architecture cot --seed 0
+```
+
+팀 공통 YAML config 진입점:
+
+```bash
+python main.py --config configs/basic_model.yaml --smoke --device cpu
+python main.py --config configs/looped_model.yaml --smoke --device cpu
 ```
 
 선택형 확장:
@@ -137,7 +156,7 @@ python scripts/aggregate_original_results.py runs/original/*.json \
 
 ## 검증 결과
 
-- 전체 기존·신규 테스트 통과
+- 전체 기존·신규 테스트 `36 passed`
 - Basic, Looped, Explicit CoT 단일 smoke 통과
 - Sinusoidal/RoPE와 padding/causal attention 검증 통과
 - deep-supervision 학습 경로와 noop gold 보존 검증 통과

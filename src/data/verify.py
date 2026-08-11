@@ -4,7 +4,7 @@
 # 교환을 처음부터 재시뮬레이션한 다음, 저장된 labels랑 맞는지 대조한다.
 # 생성기가 정답을 잘못 계산했으면 여기서 걸린다.
 #
-#   python verify.py    (torch 필요)
+#   python -m src.data.verify    (torch 필요)
 
 import random
 

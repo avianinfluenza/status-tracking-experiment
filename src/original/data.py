@@ -17,8 +17,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from ..collate import BallSwapDataset, encode_body
-from ..vocab import COLORS, N_ENTITIES, PAD_ID, SLOTS, TOK2ID, VOCAB_SIZE
+from ..data.collate import BallSwapDataset, encode_body
+from ..data.vocab import COLORS, N_ENTITIES, PAD_ID, SLOTS, TOK2ID, VOCAB_SIZE
 
 
 # Keep src.vocab's ID order untouched so old checkpoints and data remain valid.

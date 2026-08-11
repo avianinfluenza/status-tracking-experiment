@@ -16,7 +16,7 @@ from torch import Tensor, nn
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset, Subset
 
-from ..collate import BallSwapDataset, collate_fn
+from ..data.collate import BallSwapDataset, collate_fn
 from .data import (
     ExplicitCoTDataset,
     RowsDataset,

@@ -3,7 +3,7 @@
 # 파일에는 문제의 원본만 저장한다: 초기 배정, 교환 목록, 정답, (읽기용) text.
 # 토큰화/패딩/SLOT 부착은 학습 시점에 collate.py가 한다.
 #
-#   python data.py --n-train 10000 --n-test 500
+#   python -m src.data.data --out data --n-train 10000 --n-test 500
 #
 # 만들고 나면 verify.py 꼭 돌려볼 것.
 

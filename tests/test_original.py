@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from src.collate import collate_fn
+from src.data.collate import collate_fn
 from src.original.analysis import flatten_result, summarize_rows
 from src.original.data import (
     COLOR_IDS,
@@ -24,6 +24,7 @@ from src.original.model import (
     OriginalModelConfig,
     RecurrentTransformer,
 )
+from src.trainer import config_to_argv
 
 
 def sample_row() -> dict[str, object]:
@@ -208,3 +209,25 @@ def test_original_result_aggregation_keeps_seed_and_swap_axes() -> None:
     assert swap_summary["n_seeds"] == 3
     assert swap_summary["mean"] == pytest.approx(0.4)
     assert swap_summary["std"] == pytest.approx(0.2)
+
+
+def test_team_yaml_config_maps_to_canonical_trainer_cli() -> None:
+    arguments = config_to_argv({
+        "architecture": "looped",
+        "position_encoding": "rope",
+        "d_model": 32,
+        "n_heads": 4,
+        "d_ff": 64,
+        "num_loops": 2,
+        "training": {"epochs": 1, "batch_size": 8, "seed": 3},
+        "adaptive_halting": {
+            "enabled_at_evaluation": True,
+            "threshold": 0.01,
+            "min_loops": 2,
+            "patience": 1,
+        },
+    })
+    assert arguments[:2] == ["--architecture", "recurrent"]
+    assert "--position-encoding" in arguments
+    assert "rope" in arguments
+    assert "--adaptive-kl-eval" in arguments

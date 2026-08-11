@@ -11,7 +11,7 @@ Transformer가 일반 Transformer보다 우위를 보이는가?
 자원으로 사용되는지를 실험적으로 검증한다.
 
 주 실험의 가설–코드 대응과 해석 기준은 [RESEARCH_DESIGN.md](RESEARCH_DESIGN.md),
-기존 ball-swap 데이터 형식은 [DATASET.md](DATASET.md) 참고. 팀의 초기 합의안을
+기존 ball-swap 데이터 형식은 [docs/DATASET.md](docs/DATASET.md) 참고. 팀의 초기 합의안을
 그대로 재현하는 별도 실행 경로는 [ORIGINAL_PLAN.md](ORIGINAL_PLAN.md)에 있다.
 이번 모델 작업의 배경, 변경 범위, 검증 상태와 다음 작업은
 [MODEL_DESIGN_HANDOFF.md](MODEL_DESIGN_HANDOFF.md)에 정리했다.
@@ -35,14 +35,12 @@ Transformer가 일반 Transformer보다 우위를 보이는가?
 ```
 data/    train / id_test / ood_x4 / ood_x8 (jsonl, 예시 데이터셋 포함)
 src/
+├── data/        데이터 생성, vocab, collate, 검증
+├── model/       공통 classifier와 Basic/Looped 모델 진입점
 ├── systematic/  target depth와 distractor를 독립 통제하는 주 연구 파이프라인
 ├── original/    초기 팀 스코프(Direct/Explicit CoT/Recurrent) 재현 경로
-├── vocab.py     고정 vocab 23개 (건드리지 말 것)
-├── data.py      데이터 생성기
-├── collate.py   Dataset + collate_fn (토큰화/패딩/SLOT 부착)
-├── model.py     Vanilla / Recurrent Transformer + 공통 slot 분류기
 ├── train.py     학습, ID/OOD 평가, checkpoint/result 저장
-└── verify.py    데이터 파이프라인 검증
+└── trainer.py   YAML config를 실제 trainer CLI로 연결
 ```
 
 `data/`에 올라가 있는 jsonl은 기본 설정(seed 0)으로 만든 예시 데이터셋이다.
@@ -51,9 +49,8 @@ src/
 ## 시작하기
 
 ```bash
-cd src
-python verify.py                              # 파이프라인 검증
-python data.py --n-train 10000 --n-test 500   # 데이터 재생성 (data/와 동일)
+python -m src.data.verify
+python -m src.data.data --out data --n-train 10000 --n-test 500
 ```
 
 Python 3.10+, PyTorch 필요 (데이터 생성만은 torch 없이 됨).
@@ -64,7 +61,7 @@ Python 3.10+, PyTorch 필요 (데이터 생성만은 torch 없이 됨).
 
 ```bash
 python -m pip install -e '.[dev]'
-python -m src.verify
+python -m src.data.verify
 pytest
 
 # 유효 깊이 매칭: L=4 vs T=4
@@ -99,6 +96,13 @@ python scripts/run_original_experiments.py --architecture direct --smoke --devic
 python scripts/run_original_experiments.py --architecture cot --smoke --device cpu
 python scripts/run_original_experiments.py --architecture recurrent --smoke --device cpu \
   --adaptive-kl-eval
+```
+
+새 `main`의 YAML config 진입점도 같은 trainer를 실행한다.
+
+```bash
+python main.py --config configs/basic_model.yaml --smoke --device cpu
+python main.py --config configs/looped_model.yaml --smoke --device cpu
 ```
 
 Basic/Looped 3-seed 실행과 swap-length 집계:

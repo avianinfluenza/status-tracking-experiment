@@ -9,8 +9,8 @@ from typing import Literal, Sequence
 import torch
 from torch import Tensor, nn
 
-from ..classifier import Classifier
-from ..vocab import N_ENTITIES, N_LABELS, PAD_ID, VOCAB_SIZE
+from ..data.vocab import N_ENTITIES, N_LABELS, PAD_ID, VOCAB_SIZE
+from ..model.classifier import Classifier
 from .data import (
     BOS_ID,
     COLOR_IDS,

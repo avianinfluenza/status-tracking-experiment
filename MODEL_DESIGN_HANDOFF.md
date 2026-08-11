@@ -81,6 +81,12 @@ autoregressive하게 생성한다. 따라서 Explicit CoT만 중간 정답을 �
 
 | 파일 | 역할 |
 |---|---|
+| `src/data/` | vocabulary, collate, dataset, 독립 데이터 검증기 |
+| `src/model/state_tracking.py` | 확장 연구안의 Standard/Recurrent 및 안정화 ablation |
+| `src/model/classifier.py` | 두 연구 경로가 공유하는 slot classifier |
+| `src/model/basic_transformer.py` | 팀 공통 Basic 모델 import 경로 |
+| `src/model/looped_transformer.py` | 팀 공통 Looped 모델 import 경로 |
+| `src/trainer.py` | 팀 YAML 설정을 초기 연구안 실행기로 연결하는 adapter |
 | `src/original/model.py` | Direct, Explicit CoT, Recurrent, Sinusoidal/RoPE, KL halting |
 | `src/original/data.py` | 기존 row의 CoT trace 변환과 symbolic replay |
 | `src/original/experiment.py` | 학습, ID/OOD 평가, 결과 및 checkpoint 저장 |
@@ -88,6 +94,7 @@ autoregressive하게 생성한다. 따라서 Explicit CoT만 중간 정답을 �
 | `configs/original.yaml` | 초기 연구안 기준 설정 |
 | `configs/basic_model.yaml` | Basic 모델의 명시적 기준 설정 |
 | `configs/looped_model.yaml` | Looped 모델과 KL halting 기준 설정 |
+| `main.py` | YAML 설정 또는 기존 CLI를 선택하는 통합 진입점 |
 | `tests/test_original.py` | 반복식, PE, KL halting, CoT 누수·cache 검증 |
 | `ORIGINAL_PLAN.md` | 초기 연구안의 실행법과 해석상 한계 |
 | `IMPLEMENTATION_COMPLETE.md` | 최종 기능, 다중 seed, 집계·그래프 실행법 |
@@ -98,7 +105,7 @@ autoregressive하게 생성한다. 따라서 Explicit CoT만 중간 정답을 �
 
 ```bash
 python -m pip install -e '.[dev]'
-python -m src.verify
+python -m src.data.verify
 pytest
 ```
 
@@ -116,7 +123,7 @@ python scripts/run_original_experiments.py --architecture recurrent --smoke --de
 
 ## 6. 현재 검증 상태
 
-- 전체 테스트 `31 passed`
+- 전체 테스트 `36 passed`
 - 기존 데이터 pipeline 검증 전부 통과
 - Direct, Explicit CoT, Recurrent의 1-epoch smoke 학습 통과
 - 세 모델의 ID/OOD x4/OOD x8 평가와 결과 저장 통과

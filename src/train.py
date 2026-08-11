@@ -16,12 +16,8 @@ from torch import Tensor
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Subset
 
-try:  # Support module-style and script-style execution.
-    from .collate import BallSwapDataset, collate_fn
-    from .model import ModelConfig, StateTrackingModel, count_parameters
-except ImportError:  # pragma: no cover
-    from collate import BallSwapDataset, collate_fn
-    from model import ModelConfig, StateTrackingModel, count_parameters
+from .data.collate import BallSwapDataset, collate_fn
+from .model import ModelConfig, StateTrackingModel, count_parameters
 
 
 ROOT = Path(__file__).resolve().parents[1]

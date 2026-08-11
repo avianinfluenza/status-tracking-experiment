@@ -1,6 +1,6 @@
 # 기존 ball-swap 모델링 및 안정화 ablation 매뉴얼
 
-> 이 문서는 `src/model.py`의 기존 ball-swap 보조 과제를 설명한다. 연구 주제의
+> 이 문서는 `src/model/state_tracking.py`의 기존 ball-swap 보조 과제를 설명한다. 연구 주제의
 > 주 실험과 H1–H3 판정은 `RESEARCH_DESIGN.md` 및 `src/systematic/`을 기준으로 한다.
 
 ## 1. 공통 입출력
@@ -72,7 +72,7 @@ hidden update 조건을 반드시 함께 사용한다. 고정 `T` 비교는 기�
 
 ```bash
 python -m pip install -e '.[dev]'
-python -m src.verify
+python -m src.data.verify
 pytest
 
 # 유효 깊이 매칭

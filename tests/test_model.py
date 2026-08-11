@@ -5,8 +5,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from src.collate import BallSwapDataset, collate_fn
-from src.classifier import Classifier
+from src.data.collate import BallSwapDataset, collate_fn
+from src.model.classifier import Classifier
 from src.model import (
     ModelConfig,
     RecurrentTransformerEncoder,
