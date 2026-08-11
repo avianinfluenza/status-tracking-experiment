@@ -2,94 +2,49 @@
 
 YAI 2026 여름방학 기초NLP연구팀 Toy project
 
-자연어로 서술된 상태추적 과제에서, 같은 블록을 반복해서 도는(recurrent)
-Transformer가 일반 Transformer보다 우위를 보이는가?
+자연어로 서술된 5인 공 교환 상태추적 과제에서, 같은 블록을 반복하는 Looped
+Transformer가 일반 Transformer보다 길이 일반화에 유리한지 비교한다.
 
-일반 Transformer의 계산 깊이는 고정되어 있지만 이것이 곧 상태 갱신 횟수가
-레이어 수를 넘으면 반드시 실패한다는 뜻은 아니다. 본 연구는 그 관계를 가정하지
-않고, target transition depth를 통제해 recurrent computation이 실제 추가 계산
-자원으로 사용되는지를 실험적으로 검증한다.
+## 연구 범위
 
-주 실험의 가설–코드 대응과 해석 기준은 [RESEARCH_DESIGN.md](RESEARCH_DESIGN.md),
-기존 ball-swap 데이터 형식은 [docs/DATASET.md](docs/DATASET.md) 참고. 팀의 초기 합의안을
-그대로 재현하는 별도 실행 경로는 [ORIGINAL_PLAN.md](ORIGINAL_PLAN.md)에 있다.
-이번 모델 작업의 배경, 변경 범위, 검증 상태와 다음 작업은
-[MODEL_DESIGN_HANDOFF.md](MODEL_DESIGN_HANDOFF.md)에 정리했다.
-완료된 trainer, 다중 seed 실행, 집계·그래프와 선택형 확장 사용법은
-[IMPLEMENTATION_COMPLETE.md](IMPLEMENTATION_COMPLETE.md)에 정리했다.
+- 인물 5명과 색 공 5개
+- 출력은 5명 모두의 최종 공 색
+- 난이도는 전체 공 교환 횟수로 정의
+- ID는 학습 범위와 같은 swap length, OOD는 `ood_x4`, `ood_x8`
+- 비교 모델은 Direct, Explicit CoT, Recurrent
+- 위치 표현은 Sinusoidal/RoPE 중 선택
+- Recurrent update는 `h = e + block(h)`
+- adaptive stopping은 연속 출력 분포의 symmetric KL만 사용
 
-## 비교 대상
-
-| 조건 | 구조 |
-|---|---|
-| Standard | TransformerBlock × L (독립 가중치) |
-| R0 Recurrent | TransformerBlock × 1을 T회 반복, conditioning 없음 |
-| R1 ablation | R0 + learned loop embedding |
-| Partial sharing | A/B 또는 A/B/C/D block을 순환 반복 |
-| Untied control | 같은 iteration API, step마다 독립 block |
-
-비교 짝은 compute matching과 parameter matching을 별도 표로 보고한다.
+세부 모델 설계와 실행 기준은 [ORIGINAL_PLAN.md](ORIGINAL_PLAN.md), 작업 범위와
+인수인계 내용은 [MODEL_DESIGN_HANDOFF.md](MODEL_DESIGN_HANDOFF.md), 전체 구현 목록은
+[IMPLEMENTATION_COMPLETE.md](IMPLEMENTATION_COMPLETE.md)를 참고한다. 데이터 형식은
+[docs/DATASET.md](docs/DATASET.md)에 정리되어 있다.
 
 ## 구조
 
-```
-data/    train / id_test / ood_x4 / ood_x8 (jsonl, 예시 데이터셋 포함)
-src/
-├── data/        데이터 생성, vocab, collate, 검증
-├── model/       공통 classifier와 Basic/Looped 모델 진입점
-├── systematic/  target depth와 distractor를 독립 통제하는 주 연구 파이프라인
-├── original/    초기 팀 스코프(Direct/Explicit CoT/Recurrent) 재현 경로
-├── train.py     학습, ID/OOD 평가, checkpoint/result 저장
-└── trainer.py   YAML config를 실제 trainer CLI로 연결
-```
-
-`data/`에 올라가 있는 jsonl은 기본 설정(seed 0)으로 만든 예시 데이터셋이다.
-그대로 학습에 써도 되고, 조건 바꿔서 새로 만들어도 된다.
-
-## 시작하기
-
-```bash
-python -m src.data.verify
-python -m src.data.data --out data --n-train 10000 --n-test 500
+```text
+data/               train / id_test / ood_x4 / ood_x8 JSONL
+configs/            Basic, Looped, 전체 비교 설정
+scripts/            단일·다중 seed 실행, 결과 집계와 그래프
+src/data/           vocabulary, collate, dataset, 데이터 검증
+src/model/          Basic/Looped 진입점과 shared classifier
+src/original/       Direct, Explicit CoT, Recurrent 및 학습·평가 구현
+src/trainer.py      YAML config를 실험 실행기로 연결
+tests/              모델, mask, CoT, KL halting, 결과 집계 테스트
 ```
 
-Python 3.10+, PyTorch 필요 (데이터 생성만은 torch 없이 됨).
-
-## 모델 학습
-
-설계 근거와 공정 비교 규칙은 [MODELING.md](MODELING.md)에 정리되어 있다.
+## 설치와 검증
 
 ```bash
 python -m pip install -e '.[dev]'
 python -m src.data.verify
 pytest
-
-# 유효 깊이 매칭: L=4 vs T=4
-python -m src.train --model vanilla --num-layers 4 --seed 0
-python -m src.train --model recurrent --recurrent-steps 4 --seed 0
-
-# 파라미터 매칭: L=1 vs T=4
-python -m src.train --model vanilla --num-layers 1 --seed 0
-python -m src.train --model recurrent --recurrent-steps 4 --seed 0
 ```
 
-기존 `src/train.py`는 ball-swap 회귀/보조 실험이다. 연구 질문의 주 결과에는
-`scripts/run_systematic_experiments.py`를 사용한다. 이 경로는 symbolic simulator가
-gold를 만들고, `target_depth`, distractor, total events를 각각 기록한다.
+## 실행
 
-R0의 기본값은 `loop_conditioning=none`, `residual_scale=1.0`이며 학습 loop보다 큰
-inference loop를 허용한다. Conditioning, random-loop training, residual scaling,
-adaptive halting은 주 조건과 섞지 않고 각각 ablation으로 보고한다.
-
-```bash
-python scripts/run_systematic_experiments.py --smoke
-python scripts/run_systematic_experiments.py --architecture standard --num-layers 6 --seed 0
-python scripts/run_systematic_experiments.py --architecture recurrent --train-loops 6 --seed 0
-```
-
-확장안 채택 여부와 무관하게 원래 팀 설계를 실행할 수 있다. 이 경로는 5명 전체
-상태, 총 swap length 기준 ID/OOD, Sinusoidal/RoPE 선택, `h=e+block(h)`,
-출력 KL-only halting을 고정한다.
+단일 모델의 빠른 실행 확인:
 
 ```bash
 python scripts/run_original_experiments.py --architecture direct --smoke --device cpu
@@ -98,44 +53,27 @@ python scripts/run_original_experiments.py --architecture recurrent --smoke --de
   --adaptive-kl-eval
 ```
 
-새 `main`의 YAML config 진입점도 같은 trainer를 실행한다.
+YAML config 진입점:
 
 ```bash
 python main.py --config configs/basic_model.yaml --smoke --device cpu
 python main.py --config configs/looped_model.yaml --smoke --device cpu
 ```
 
-Basic/Looped 3-seed 실행과 swap-length 집계:
+3개 seed의 Basic/Looped 비교와 swap-length별 집계:
 
 ```bash
-python scripts/run_original_multiseed.py --seeds 0 1 2 \
-  --architectures direct recurrent --adaptive-kl-eval
-python scripts/plot_original_results.py runs/original/aggregate/summary.csv \
+python scripts/run_original_multiseed.py \
+  --seeds 0 1 2 \
+  --architectures direct recurrent \
+  --position-encoding sinusoidal \
+  --adaptive-kl-eval
+
+python scripts/plot_original_results.py \
+  runs/original/aggregate/summary.csv \
   --output-dir runs/original/figures
 ```
 
-빠른 smoke test:
-
-```bash
-python -m src.train --model recurrent --recurrent-steps 2 --epochs 1 \
-  --d-model 32 --n-heads 4 --dim-feedforward 64 \
-  --max-train-samples 64 --max-eval-samples 16 --device cpu
-```
-
-## 결과 규약
-
-각 run은 결과 JSON, checkpoint와 SHA-256, per-example prediction JSONL을 함께
-생성한다. 여러 seed 실행 후 다음 명령으로 raw long-format CSV와 통계를 만든다.
-
-```bash
-python scripts/aggregate_systematic_results.py results/*.json \
-  --out-dir results/aggregate
-
-python -m pip install -e '.[analysis]'
-python scripts/plot_systematic_results.py results/aggregate/summary.csv \
-  --out-dir results/figures
-```
-
-`raw_long.csv`는 `model × seed × depth × loop × condition` 단위를 유지한다. JSON에는
-optimizer, scheduler, generator version, checkpoint hash, parameter 수, FLOPs 추정,
-latency, peak memory, gradient/hidden norm이 기록된다.
+각 run은 ID/OOD별 slot accuracy, 5-person exact match, swap 횟수별 exact match와
+checkpoint를 기록한다. KL halting을 사용하면 평균 loop 수, halt rate, 마지막
+symmetric KL도 함께 저장한다.
