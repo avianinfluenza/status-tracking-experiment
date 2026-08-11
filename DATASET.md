@@ -92,6 +92,7 @@ collate_fn이 이미 붙어 있어서 이거면 끝이다. 배치는 dict 하나
 | `attn_mask` | [B, L] | 1=실제 토큰, 0=PAD |
 | `slot_pos` | [B, 5] | SLOT 토큰 5개의 위치 (배치 안에서는 전부 동일) |
 | `labels` | [B, 5] | 각 인물의 최종 공 색. -100이면 그 칸은 무시 |
+| `n_swaps` | [B] | 교환 횟수. 길이별 exact match 집계용 |
 
 ### 2. 모델이 지켜야 할 것
 
@@ -183,15 +184,12 @@ for split in ["id_test", "ood_x4", "ood_x8"]:
 지표는 **exact match**(5칸 전부 정답인 샘플 비율)로 통일하자. 슬롯 단위 정확도는
 찍어도 점수가 나와서 모델이 무너진 걸 가려버린다.
 
-결과 그림은 교환 횟수별로 쪼개서 그리는 게 제일 잘 보인다. `n_swaps`가 배치
-텐서에는 안 들어가니까, 분석할 때는 Dataset에서 직접 뽑으면 된다:
+결과 그림은 교환 횟수별로 쪼개서 그리는 게 제일 잘 보인다. 현재 collate 결과에는
+`n_swaps` 텐서가 포함되므로 평가 loop에서 바로 집계할 수 있다:
 
 ```python
-from collate import BallSwapDataset, collate_fn
-
-ds = BallSwapDataset("data/ood_x8.jsonl")
-# 샘플 하나씩 돌리면서 (ds[i]["n_swaps"], 맞았는지) 쌓기
-rows = [collate_fn([ds[i]]) for i in range(len(ds))]   # 배치 크기 1
+for n_swaps, is_exact in zip(batch["n_swaps"].tolist(), hit.tolist()):
+    by_swaps.setdefault(n_swaps, []).append(is_exact)
 ```
 
 x축 교환 횟수, y축 exact match로 vanilla와 recurrent를 겹쳐 그리면

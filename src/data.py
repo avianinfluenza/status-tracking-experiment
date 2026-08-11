@@ -13,7 +13,10 @@ import random
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-from vocab import NAMES, COLORS, N_ENTITIES
+try:  # module-style and script-style execution 둘 다 지원
+    from .vocab import NAMES, COLORS, N_ENTITIES
+except ImportError:  # pragma: no cover
+    from vocab import NAMES, COLORS, N_ENTITIES
 
 
 @dataclass

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "status-tracking-experiment"
+version = "0.1.0"
+description = "Vanilla and recurrent Transformer baselines for natural-language state tracking"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.26", "torch>=2.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+analysis = ["matplotlib>=3.8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.setuptools.packages.find]
+include = ["src*"]

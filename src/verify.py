@@ -8,10 +8,16 @@
 
 import random
 
-from vocab import (NAMES, COLORS, SLOTS, ID2TOK, PAD, PAD_ID,
-                   TOPIC, decode)
-from data import GenConfig, sample_problem, to_row, josa
-from collate import collate_fn, SLOT_IDS
+try:  # module-style and script-style execution 둘 다 지원
+    from .vocab import (NAMES, COLORS, SLOTS, ID2TOK, PAD, PAD_ID,
+                        TOPIC, decode)
+    from .data import GenConfig, sample_problem, to_row, josa
+    from .collate import collate_fn, SLOT_IDS
+except ImportError:  # pragma: no cover
+    from vocab import (NAMES, COLORS, SLOTS, ID2TOK, PAD, PAD_ID,
+                       TOPIC, decode)
+    from data import GenConfig, sample_problem, to_row, josa
+    from collate import collate_fn, SLOT_IDS
 
 NAME_SET = set(NAMES)
 
