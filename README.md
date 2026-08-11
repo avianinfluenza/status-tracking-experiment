@@ -15,6 +15,8 @@ Transformer가 일반 Transformer보다 우위를 보이는가?
 그대로 재현하는 별도 실행 경로는 [ORIGINAL_PLAN.md](ORIGINAL_PLAN.md)에 있다.
 이번 모델 작업의 배경, 변경 범위, 검증 상태와 다음 작업은
 [MODEL_DESIGN_HANDOFF.md](MODEL_DESIGN_HANDOFF.md)에 정리했다.
+완료된 trainer, 다중 seed 실행, 집계·그래프와 선택형 확장 사용법은
+[IMPLEMENTATION_COMPLETE.md](IMPLEMENTATION_COMPLETE.md)에 정리했다.
 
 ## 비교 대상
 
@@ -97,6 +99,15 @@ python scripts/run_original_experiments.py --architecture direct --smoke --devic
 python scripts/run_original_experiments.py --architecture cot --smoke --device cpu
 python scripts/run_original_experiments.py --architecture recurrent --smoke --device cpu \
   --adaptive-kl-eval
+```
+
+Basic/Looped 3-seed 실행과 swap-length 집계:
+
+```bash
+python scripts/run_original_multiseed.py --seeds 0 1 2 \
+  --architectures direct recurrent --adaptive-kl-eval
+python scripts/plot_original_results.py runs/original/aggregate/summary.csv \
+  --output-dir runs/original/figures
 ```
 
 빠른 smoke test:

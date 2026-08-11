@@ -5,9 +5,19 @@ import copy
 import pytest
 import torch
 from torch import nn
+from torch.utils.data import DataLoader
 
 from src.collate import collate_fn
-from src.original.data import COLOR_IDS, build_cot_example, collate_cot, replay_states
+from src.original.analysis import flatten_result, summarize_rows
+from src.original.data import (
+    COLOR_IDS,
+    RowsDataset,
+    build_cot_example,
+    collate_cot,
+    inject_noop_swaps,
+    replay_states,
+)
+from src.original.experiment import train_epoch
 from src.original.model import (
     DirectTransformer,
     ExplicitCoTTransformer,
@@ -89,6 +99,34 @@ def test_adaptive_recurrence_uses_kl_only_and_halts_stable_outputs() -> None:
     torch.testing.assert_close(diagnostics["symmetric_kl"][:, 1], torch.zeros(2))
 
 
+def test_recurrent_exposes_every_loop_for_optional_deep_supervision() -> None:
+    batch = collate_fn([sample_row(), sample_row()])
+    model = RecurrentTransformer(tiny_config("recurrent"))
+    logits = model.forward_all_loops(
+        batch["input_ids"], batch["attn_mask"], batch["slot_pos"]
+    )
+    assert logits.shape == (2, 3, 5, 5)
+    torch.testing.assert_close(model(
+        batch["input_ids"], batch["attn_mask"], batch["slot_pos"]
+    ), logits[:, -1])
+
+
+def test_deep_supervision_training_ablation_runs() -> None:
+    rows = [sample_row(), sample_row()]
+    loader = DataLoader(RowsDataset(rows), batch_size=2, collate_fn=collate_fn)
+    model = RecurrentTransformer(tiny_config("recurrent"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    loss = train_epoch(
+        model,
+        loader,
+        optimizer,
+        torch.device("cpu"),
+        grad_clip=1.0,
+        deep_supervision_weight=0.5,
+    )
+    assert loss > 0.0
+
+
 def test_cot_targets_only_colors_after_slot_prompts() -> None:
     example = build_cot_example(sample_row())
     targets = [target for target in example.lm_labels if target != -100]
@@ -97,6 +135,15 @@ def test_cot_targets_only_colors_after_slot_prompts() -> None:
     batch = collate_cot([sample_row(), sample_row()])
     assert batch["input_ids"].shape == batch["lm_labels"].shape
     assert int((batch["lm_labels"] != -100).sum()) == 2 * 3 * 5
+
+
+def test_noop_robustness_view_preserves_gold_state() -> None:
+    row = sample_row()
+    augmented = inject_noop_swaps([row], ratio=0.5, seed=7)[0]
+    assert augmented["labels"] == row["labels"]
+    assert augmented["n_swaps"] == 5
+    assert replay_states(augmented["init"], augmented["swaps"])[-1] == row["labels"]  # type: ignore[arg-type]
+    assert any(left == right for left, right in augmented["swaps"])  # type: ignore[assignment]
 
 
 def test_cot_evaluation_does_not_read_stored_final_labels() -> None:
@@ -136,3 +183,28 @@ def test_cot_incremental_cache_matches_full_causal_forward(position_encoding: st
             offset += width
         incremental = torch.cat(chunks, dim=1)
     torch.testing.assert_close(incremental, full, atol=1e-5, rtol=1e-5)
+
+
+def test_original_result_aggregation_keeps_seed_and_swap_axes() -> None:
+    results = []
+    for seed, score in enumerate((0.2, 0.4, 0.6)):
+        results.append({
+            "config": {"architecture": "direct", "position_encoding": "sinusoidal"},
+            "seed": seed,
+            "splits": {
+                "id_test": {
+                    "exact_match": score,
+                    "slot_accuracy": score + 0.1,
+                    "n_samples": 10,
+                    "by_swaps": {
+                        "2": {"exact_match": score, "correct": int(score * 10), "total": 10}
+                    },
+                }
+            },
+        })
+    raw = [row for result in results for row in flatten_result(result)]
+    summary = summarize_rows(raw)
+    swap_summary = next(row for row in summary if row["n_swaps"] == 2)
+    assert swap_summary["n_seeds"] == 3
+    assert swap_summary["mean"] == pytest.approx(0.4)
+    assert swap_summary["std"] == pytest.approx(0.2)

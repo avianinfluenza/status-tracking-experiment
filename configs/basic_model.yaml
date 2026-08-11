@@ -1,0 +1,22 @@
+# Basic/Direct Transformer for the five-person ball-swap task.
+architecture: direct
+position_encoding: sinusoidal  # ablation: rope
+d_model: 128
+n_heads: 4
+d_ff: 512
+dropout: 0.0
+num_layers: 6
+classifier_dim: 2
+
+training:
+  epochs: 30
+  batch_size: 128
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  seeds: [0, 1, 2]
+
+evaluation:
+  splits: [id_test, ood_x4, ood_x8]
+  metrics: [slot_accuracy, exact_match, exact_match_by_swaps]

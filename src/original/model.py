@@ -314,13 +314,32 @@ class RecurrentTransformer(TokenBackbone):
         *,
         num_loops: int | None = None,
     ) -> Tensor:
+        return self.forward_all_loops(
+            input_ids,
+            attention_mask,
+            slot_positions,
+            num_loops=num_loops,
+        )[:, -1]
+
+    def forward_all_loops(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        slot_positions: Tensor,
+        *,
+        num_loops: int | None = None,
+    ) -> Tensor:
+        """Return slot logits from every loop for optional deep supervision."""
+
         e, h, positions = self.prepare(input_ids, attention_mask)
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
             raise ValueError("num_loops must be positive")
+        outputs = []
         for _ in range(loops):
             h = self.recurrent_step(e, h, attention_mask, positions)
-        return self._classify(h, attention_mask, slot_positions)
+            outputs.append(self._classify(h, attention_mask, slot_positions))
+        return torch.stack(outputs, dim=1)
 
     @torch.inference_mode()
     def forward_adaptive(

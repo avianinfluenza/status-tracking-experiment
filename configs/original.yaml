@@ -31,6 +31,9 @@ recurrent:
     threshold: 0.001
     min_loops: 2
     patience: 1
+  ablations:
+    deep_supervision_weight: 0.0
+    noop_eval_ratio: 0.0
 
 training:
   epochs: 30
@@ -40,3 +43,8 @@ training:
   weight_decay: 0.01
   gradient_clip: 1.0
   seeds: [0, 1, 2]
+
+analysis:
+  aggregate: scripts/aggregate_original_results.py
+  plot: scripts/plot_original_results.py
+  multiseed_runner: scripts/run_original_multiseed.py

@@ -17,7 +17,13 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from ..collate import BallSwapDataset, collate_fn
-from .data import ExplicitCoTDataset, collate_cot, group_rows_by_swap_count
+from .data import (
+    ExplicitCoTDataset,
+    RowsDataset,
+    collate_cot,
+    group_rows_by_swap_count,
+    inject_noop_swaps,
+)
 from .model import (
     DirectTransformer,
     ExplicitCoTTransformer,
@@ -90,6 +96,7 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     grad_clip: float,
+    deep_supervision_weight: float = 0.0,
 ) -> float:
     model.train()
     weighted_loss = 0.0
@@ -99,14 +106,41 @@ def train_epoch(
         if isinstance(model, ExplicitCoTTransformer):
             logits = model(batch["input_ids"], batch["attention_mask"])
             targets = batch["lm_labels"]
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                ignore_index=-100,
+            )
+        elif isinstance(model, RecurrentTransformer) and deep_supervision_weight > 0.0:
+            loop_logits = model.forward_all_loops(
+                batch["input_ids"], batch["attn_mask"], batch["slot_pos"]
+            )
+            targets = batch["labels"]
+            final_logits = loop_logits[:, -1]
+            final_loss = F.cross_entropy(
+                final_logits.reshape(-1, final_logits.shape[-1]),
+                targets.reshape(-1),
+                ignore_index=-100,
+            )
+            if loop_logits.shape[1] > 1:
+                intermediate = loop_logits[:, :-1]
+                repeated_targets = targets[:, None].expand(-1, intermediate.shape[1], -1)
+                intermediate_loss = F.cross_entropy(
+                    intermediate.reshape(-1, intermediate.shape[-1]),
+                    repeated_targets.reshape(-1),
+                    ignore_index=-100,
+                )
+                loss = final_loss + deep_supervision_weight * intermediate_loss
+            else:
+                loss = final_loss
         else:
             logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
             targets = batch["labels"]
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.shape[-1]),
-            targets.reshape(-1),
-            ignore_index=-100,
-        )
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.shape[-1]),
+                targets.reshape(-1),
+                ignore_index=-100,
+            )
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_clip > 0:
@@ -271,6 +305,18 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--kl-threshold", type=float, default=1e-3)
     parser.add_argument("--min-loops", type=int, default=2)
     parser.add_argument("--halting-patience", type=int, default=1)
+    parser.add_argument(
+        "--deep-supervision-weight",
+        type=float,
+        default=0.0,
+        help="optional recurrent ablation: CE on every non-final loop",
+    )
+    parser.add_argument(
+        "--noop-eval-ratio",
+        type=float,
+        default=0.0,
+        help="also evaluate ID rows after inserting this fraction of self-swaps",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=128)
@@ -291,6 +337,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def run(args: argparse.Namespace) -> dict[str, object]:
     if args.adaptive_kl_eval and args.architecture != "recurrent":
         raise ValueError("--adaptive-kl-eval requires --architecture recurrent")
+    if args.deep_supervision_weight < 0.0:
+        raise ValueError("--deep-supervision-weight must be non-negative")
+    if args.deep_supervision_weight > 0.0 and args.architecture != "recurrent":
+        raise ValueError("deep supervision is available only for the recurrent model")
+    if args.noop_eval_ratio < 0.0:
+        raise ValueError("--noop-eval-ratio must be non-negative")
     if args.smoke:
         args.epochs = 1
         args.d_model = 32
@@ -333,7 +385,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     started = time.perf_counter()
     losses = []
     for _epoch in range(1, args.epochs + 1):
-        losses.append(train_epoch(model, train_loader, optimizer, device, args.grad_clip))
+        losses.append(
+            train_epoch(
+                model,
+                train_loader,
+                optimizer,
+                device,
+                args.grad_clip,
+                deep_supervision_weight=args.deep_supervision_weight,
+            )
+        )
     training_seconds = time.perf_counter() - started
 
     split_metrics: dict[str, object] = {}
@@ -359,7 +420,48 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             )
         split_metrics[split] = metrics
 
-    run_name = args.run_name or f"{args.architecture}-{args.position_encoding}-seed{args.seed}"
+    if args.noop_eval_ratio > 0.0:
+        base_dataset = _subset(
+            BallSwapDataset(args.data_dir / "id_test.jsonl"),
+            args.max_eval_samples,
+        )
+        noisy_rows = inject_noop_swaps(
+            _rows_from_dataset(base_dataset),
+            ratio=args.noop_eval_ratio,
+            seed=args.seed + 50_000,
+        )
+        split_name = f"id_test_noop_{args.noop_eval_ratio:g}"
+        if isinstance(model, ExplicitCoTTransformer):
+            split_metrics[split_name] = evaluate_cot(
+                model,
+                RowsDataset(noisy_rows),
+                generation_batch_size=args.eval_batch_size,
+            )
+        else:
+            noisy_loader = DataLoader(
+                RowsDataset(noisy_rows),
+                batch_size=args.eval_batch_size,
+                shuffle=False,
+                collate_fn=collate_fn,
+            )
+            split_metrics[split_name] = evaluate_classifier(
+                model,
+                noisy_loader,
+                device,
+                adaptive_kl=args.adaptive_kl_eval,
+            )
+
+    if args.run_name:
+        run_name = args.run_name
+    else:
+        name_parts = [args.architecture, args.position_encoding, f"seed{args.seed}"]
+        if args.deep_supervision_weight > 0.0:
+            name_parts.append(f"ds{args.deep_supervision_weight:g}")
+        if args.noop_eval_ratio > 0.0:
+            name_parts.append(f"noop{args.noop_eval_ratio:g}")
+        if args.adaptive_kl_eval:
+            name_parts.append("adaptive")
+        run_name = "-".join(name_parts)
     result = {
         "track": "original_team_plan",
         "run_name": run_name,
@@ -368,6 +470,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "seed": args.seed,
         "training_loss": losses,
         "training_seconds": training_seconds,
+        "ablations": {
+            "deep_supervision_weight": args.deep_supervision_weight,
+            "noop_eval_ratio": args.noop_eval_ratio,
+        },
         "splits": split_metrics,
     }
     save_checkpoint(args.output_dir / f"{run_name}.pt", model, args.epochs)

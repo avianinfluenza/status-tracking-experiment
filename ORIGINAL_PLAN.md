@@ -59,6 +59,22 @@ python scripts/run_original_experiments.py --architecture recurrent \
 Recurrent adaptive 평가에는 평균 loop 수, halt rate, 마지막 symmetric KL도
 기록한다.
 
+3개 seed의 Basic/Looped 비교와 집계는 한 명령으로 실행한다.
+
+```bash
+python scripts/run_original_multiseed.py --seeds 0 1 2 \
+  --architectures direct recurrent --adaptive-kl-eval
+python scripts/plot_original_results.py runs/original/aggregate/summary.csv \
+  --output-dir runs/original/figures
+```
+
+Deep supervision과 noop robustness는 주 조건과 분리한 선택형 ablation이다.
+
+```bash
+python main.py --architecture recurrent --deep-supervision-weight 0.5 \
+  --noop-eval-ratio 0.5 --adaptive-kl-eval
+```
+
 ## 해석 시 주의
 
 이 경로에서 `swap length`는 context length와 state-transition depth를 분리하지

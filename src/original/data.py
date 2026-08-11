@@ -8,6 +8,8 @@ teacher-forced training; evaluation generates them autoregressively.
 
 from __future__ import annotations
 
+import copy
+import random
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -121,6 +123,50 @@ class ExplicitCoTDataset(Dataset[dict[str, object]]):
 
     def __getitem__(self, index: int) -> dict[str, object]:
         return self.rows[index]
+
+
+class RowsDataset(Dataset[dict[str, object]]):
+    """A lightweight in-memory dataset used by controlled robustness views."""
+
+    def __init__(self, rows: Sequence[dict[str, object]]) -> None:
+        self.rows = list(rows)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        return self.rows[index]
+
+
+def inject_noop_swaps(
+    rows: Sequence[dict[str, object]],
+    *,
+    ratio: float,
+    seed: int,
+) -> list[dict[str, object]]:
+    """Insert deterministic self-swaps without changing gold final states.
+
+    ``ratio`` is the number of inserted noops relative to each row's original
+    swap count.  The original swap order is preserved, and insertions are
+    sampled independently per row from a seed-derived RNG.
+    """
+
+    if ratio <= 0.0:
+        raise ValueError("noop ratio must be positive")
+    augmented: list[dict[str, object]] = []
+    for row_index, row in enumerate(rows):
+        result = copy.deepcopy(row)
+        swaps = [list(pair) for pair in result["swaps"]]  # type: ignore[index]
+        n_noops = max(1, round(len(swaps) * ratio))
+        rng = random.Random(seed * 1_000_003 + row_index)
+        for _ in range(n_noops):
+            entity = rng.randrange(N_ENTITIES)
+            position = rng.randrange(len(swaps) + 1)
+            swaps.insert(position, [entity, entity])
+        result["swaps"] = swaps
+        result["n_swaps"] = len(swaps)
+        augmented.append(result)
+    return augmented
 
 
 def collate_cot(batch: Sequence[dict[str, object]]) -> dict[str, Tensor]:

@@ -86,8 +86,11 @@ autoregressive하게 생성한다. 따라서 Explicit CoT만 중간 정답을 �
 | `src/original/experiment.py` | 학습, ID/OOD 평가, 결과 및 checkpoint 저장 |
 | `scripts/run_original_experiments.py` | 초기 연구안 실행 CLI |
 | `configs/original.yaml` | 초기 연구안 기준 설정 |
+| `configs/basic_model.yaml` | Basic 모델의 명시적 기준 설정 |
+| `configs/looped_model.yaml` | Looped 모델과 KL halting 기준 설정 |
 | `tests/test_original.py` | 반복식, PE, KL halting, CoT 누수·cache 검증 |
 | `ORIGINAL_PLAN.md` | 초기 연구안의 실행법과 해석상 한계 |
+| `IMPLEMENTATION_COMPLETE.md` | 최종 기능, 다중 seed, 집계·그래프 실행법 |
 
 ## 5. 실행 방법
 
@@ -123,15 +126,15 @@ python scripts/run_original_experiments.py --architecture recurrent --smoke --de
 Smoke accuracy는 극소량 데이터와 1 epoch로 얻은 값이므로 연구 결과로 해석하지
 않는다.
 
-## 7. 팀에서 결정할 사항과 다음 작업
+## 7. 구현 완료 후 팀에서 결정할 사항
 
 1. 초기 연구안을 본 실험으로 유지할지, 확장 연구안을 주 실험으로 채택할지 결정한다.
 2. Sinusoidal과 RoPE 중 하나를 고정할지, PE ablation으로 둘 다 실행할지 결정한다.
 3. Direct `L`과 Recurrent `T`를 같게 둔 compute-depth 비교 외에 parameter-matched
    비교를 추가할지 결정한다.
-4. 결정된 설정으로 최소 seed 3개를 실행한다.
+4. 본 결과를 만들 때 smoke가 아닌 설정으로 최소 seed 3개를 실행한다.
 5. KL threshold는 ID validation으로만 선택하고 OOD test 결과를 보고 조정하지 않는다.
-6. seed별 JSON을 모아 평균·표준편차와 swap-length별 성능 곡선을 만든다.
+6. 자동 생성된 평균·표준편차와 swap-length별 성능 곡선을 검토한다.
 
 초기 연구안의 결과는 **swap/context length 일반화**에 대한 근거다. 이 결과만으로
 state-transition depth의 systematic updating을 입증했다고 해석하면 안 된다.
