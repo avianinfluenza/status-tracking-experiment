@@ -8,10 +8,9 @@
 
 import random
 
-from vocab import (NAMES, COLORS, SLOTS, ID2TOK, PAD, PAD_ID,
-                   TOPIC, decode)
-from data import GenConfig, sample_problem, to_row, josa
-from collate import collate_fn, SLOT_IDS
+from data.vocab import NAMES, COLORS, SLOTS, ID2TOK, PAD, PAD_ID, TOPIC, decode
+from data.data import GenConfig, sample_problem, to_row, josa
+from data.collate import collate_fn, SLOT_IDS
 
 NAME_SET = set(NAMES)
 
@@ -73,18 +72,24 @@ def check_batch(cfg, seed, n=64):
                 want = COLORS.index(final[NAMES[j]])
             else:
                 want = -100
-            assert labels[j] == want, (
-                f"sample {i} slot {j}: labels={labels[j]} 재계산={want}\n"
-                + decode(ids, strip_pad=True))
+            assert (
+                labels[j] == want
+            ), f"sample {i} slot {j}: labels={labels[j]} 재계산={want}\n" + decode(
+                ids, strip_pad=True
+            )
 
         # text 필드가 구조 데이터랑 맞는 순서로 나오는지
         pos = -1
-        frags = [f"{NAMES[j]}{josa(NAMES[j], '은', '는')} "
-                 f"{COLORS[p['init_state'][j]]} 공을"
-                 for j in range(cfg.n_entities)]
-        frags += [f"{NAMES[a]}{josa(NAMES[a], '과', '와')} "
-                  f"{NAMES[b]}{josa(NAMES[b], '이', '가')} 공을 교환했다"
-                  for a, b in p["swaps"]]
+        frags = [
+            f"{NAMES[j]}{josa(NAMES[j], '은', '는')} "
+            f"{COLORS[p['init_state'][j]]} 공을"
+            for j in range(cfg.n_entities)
+        ]
+        frags += [
+            f"{NAMES[a]}{josa(NAMES[a], '과', '와')} "
+            f"{NAMES[b]}{josa(NAMES[b], '이', '가')} 공을 교환했다"
+            for a, b in p["swaps"]
+        ]
         for fr in frags:
             nxt = row["text"].find(fr, pos + 1)
             assert nxt > pos, f"text에서 못 찾음: {fr}"
