@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import json
+from pathlib import Path
 
 import pytest
 import torch
@@ -17,7 +19,7 @@ from src.original.data import (
     inject_noop_swaps,
     replay_states,
 )
-from src.original.experiment import train_epoch
+from src.original.experiment import parse_args, run, train_epoch
 from src.original.model import (
     DirectTransformer,
     ExplicitCoTTransformer,
@@ -311,3 +313,35 @@ def test_r0_yaml_config_maps_advanced_ball_swap_options() -> None:
     assert "--random-loops" in arguments
     assert "--eval-loop-counts" in arguments
     assert "--adaptive-kl-eval" in arguments
+
+
+def test_original_run_writes_unique_directory_with_config(tmp_path: Path) -> None:
+    argv = [
+        "--architecture", "direct",
+        "--run-name", "repeat",
+        "--smoke",
+        "--device", "cpu",
+        "--output-dir", str(tmp_path),
+        "--no-progress",
+    ]
+    first = run(parse_args(argv))
+    second = run(parse_args(argv))
+
+    first_dir = Path(str(first["run_dir"]))
+    second_dir = Path(str(second["run_dir"]))
+    assert first_dir != second_dir
+    assert first_dir.parent == tmp_path
+    assert second_dir.parent == tmp_path
+    assert first_dir.name.startswith("repeat__")
+    assert second_dir.name.startswith("repeat__")
+
+    for run_dir in (first_dir, second_dir):
+        assert (run_dir / "config.json").is_file()
+        assert (run_dir / "args.json").is_file()
+        assert (run_dir / "result.json").is_file()
+        assert (run_dir / "checkpoint.pt").is_file()
+        config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        result = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        assert config["architecture"] == "direct"
+        assert result["run_dir"] == str(run_dir)
+        assert result["paths"]["config"] == str(run_dir / "config.json")

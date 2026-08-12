@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import time
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -96,6 +98,33 @@ def _supports_loop_override(model: OriginalModel) -> bool:
     return isinstance(model, (RecurrentTransformer, RecurrentR0Transformer))
 
 
+def timestamp_label(moment: datetime | None = None) -> str:
+    return (moment or datetime.now()).strftime("%Y%m%d-%H%M%S")
+
+
+def _safe_path_name(name: str) -> str:
+    collapsed = re.sub(r"[^A-Za-z0-9._=-]+", "-", name).strip("-")
+    return collapsed or "run"
+
+
+def create_unique_run_dir(
+    output_dir: Path,
+    run_name: str,
+    *,
+    timestamp: str | None = None,
+) -> Path:
+    base = f"{_safe_path_name(run_name)}__{timestamp or timestamp_label()}"
+    for index in range(1000):
+        suffix = "" if index == 0 else f"-{index + 1:02d}"
+        candidate = output_dir / f"{base}{suffix}"
+        try:
+            candidate.mkdir(parents=True, exist_ok=False)
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError(f"could not create a unique run directory for {run_name}")
+
+
 def _progress_bar(
     iterable: Iterable,
     *,
@@ -112,6 +141,42 @@ def _progress_bar(
         position=position,
         dynamic_ncols=True,
     )
+
+
+def _json_ready(value: Any) -> Any:
+    if isinstance(value, argparse.Namespace):
+        return _json_ready(vars(value))
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(item) for item in value]
+    return value
+
+
+def build_run_name(args: argparse.Namespace) -> str:
+    if args.run_name:
+        return args.run_name
+    name_parts = [args.architecture, args.position_encoding, f"seed{args.seed}"]
+    if args.deep_supervision_weight > 0.0:
+        name_parts.append(f"ds{args.deep_supervision_weight:g}")
+    if args.noop_eval_ratio > 0.0:
+        name_parts.append(f"noop{args.noop_eval_ratio:g}")
+    if args.architecture == "recurrent-r0":
+        if args.loop_conditioning != "none":
+            name_parts.append(f"loop{args.loop_conditioning}")
+        if args.residual_scale != 1.0:
+            name_parts.append(f"rs{args.residual_scale:g}")
+        if args.recurrent_blocks != 1:
+            name_parts.append(f"blocks{args.recurrent_blocks}")
+        if args.random_loops:
+            name_parts.append("randomloops")
+    if args.adaptive_kl_eval:
+        name_parts.append("adaptive")
+    return "-".join(name_parts)
 
 
 def train_epoch(
@@ -387,7 +452,10 @@ def save_checkpoint(path: Path, model: OriginalModel, epoch: int) -> None:
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(_json_ready(payload), ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -450,6 +518,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
+    run_started_at = datetime.now()
+    run_started = time.perf_counter()
     recurrent_architectures = {"recurrent", "recurrent-r0"}
     if args.adaptive_kl_eval and args.architecture not in recurrent_architectures:
         raise ValueError("--adaptive-kl-eval requires a recurrent architecture")
@@ -514,6 +584,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         adaptive_update_threshold=args.adaptive_update_threshold,
         adaptive_min_confidence=args.adaptive_min_confidence,
     )
+    run_name = build_run_name(args)
+    run_dir = create_unique_run_dir(
+        args.output_dir,
+        run_name,
+        timestamp=timestamp_label(run_started_at),
+    )
+    config_path = run_dir / "config.json"
+    args_path = run_dir / "args.json"
+    result_path = run_dir / "result.json"
+    checkpoint_path = run_dir / "checkpoint.pt"
+    write_json(config_path, config.to_dict())
+    write_json(args_path, vars(args))
+
     model = build_model(config).to(device)
     train_loader = make_loader(
         args.data_dir / "train.jsonl",
@@ -637,29 +720,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     for loop_count in args.eval_loop_counts
                 }
 
-    if args.run_name:
-        run_name = args.run_name
-    else:
-        name_parts = [args.architecture, args.position_encoding, f"seed{args.seed}"]
-        if args.deep_supervision_weight > 0.0:
-            name_parts.append(f"ds{args.deep_supervision_weight:g}")
-        if args.noop_eval_ratio > 0.0:
-            name_parts.append(f"noop{args.noop_eval_ratio:g}")
-        if args.architecture == "recurrent-r0":
-            if args.loop_conditioning != "none":
-                name_parts.append(f"loop{args.loop_conditioning}")
-            if args.residual_scale != 1.0:
-                name_parts.append(f"rs{args.residual_scale:g}")
-            if args.recurrent_blocks != 1:
-                name_parts.append(f"blocks{args.recurrent_blocks}")
-            if args.random_loops:
-                name_parts.append("randomloops")
-        if args.adaptive_kl_eval:
-            name_parts.append("adaptive")
-        run_name = "-".join(name_parts)
+    run_finished_at = datetime.now()
+    total_seconds = time.perf_counter() - run_started
     result = {
         "track": "original_team_plan",
         "run_name": run_name,
+        "run_id": run_dir.name,
+        "run_dir": str(run_dir),
+        "started_at": run_started_at.isoformat(timespec="seconds"),
+        "finished_at": run_finished_at.isoformat(timespec="seconds"),
+        "total_seconds": total_seconds,
         "config": config.to_dict(),
         "parameters": count_parameters(model),
         "seed": args.seed,
@@ -677,10 +747,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "adaptive_update_threshold": args.adaptive_update_threshold,
             "adaptive_min_confidence": args.adaptive_min_confidence,
         },
+        "paths": {
+            "config": str(config_path),
+            "args": str(args_path),
+            "result": str(result_path),
+            "checkpoint": str(checkpoint_path),
+        },
         "splits": split_metrics,
     }
-    save_checkpoint(args.output_dir / f"{run_name}.pt", model, args.epochs)
-    write_json(args.output_dir / f"{run_name}.json", result)
+    save_checkpoint(checkpoint_path, model, args.epochs)
+    write_json(result_path, result)
     return result
 
 

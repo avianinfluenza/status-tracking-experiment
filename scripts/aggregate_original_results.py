@@ -15,12 +15,27 @@ if str(ROOT) not in sys.path:
 from src.original.analysis import aggregate_results
 
 
+def expand_result_paths(inputs: list[Path]) -> list[Path]:
+    paths: list[Path] = []
+    for path in inputs:
+        if path.is_dir():
+            direct = path / "result.json"
+            if direct.exists():
+                paths.append(direct)
+            else:
+                paths.extend(sorted(path.rglob("result.json")))
+        else:
+            paths.append(path)
+    return paths
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=Path, nargs="+")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "runs" / "original" / "aggregate")
     args = parser.parse_args()
-    loaded = [json.loads(path.read_text(encoding="utf-8")) for path in args.results]
+    result_paths = expand_result_paths(args.results)
+    loaded = [json.loads(path.read_text(encoding="utf-8")) for path in result_paths]
     payloads = [payload for payload in loaded if payload.get("track") == "original_team_plan"]
     if not payloads:
         raise SystemExit("no original_team_plan run JSON files were provided")

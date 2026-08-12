@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.original.analysis import aggregate_results
+from src.original.experiment import create_unique_run_dir
 from src.original.experiment import parse_args as parse_run_args
 from src.original.experiment import run, write_json
 
@@ -50,6 +51,12 @@ def main() -> None:
     args = parse_args()
     if len(set(args.seeds)) < 3:
         raise SystemExit("A comparison run requires at least three distinct seeds")
+    suite_name = (
+        f"multiseed-{'-'.join(args.architectures)}"
+        f"-seeds{'-'.join(map(str, sorted(set(args.seeds))))}"
+    )
+    suite_dir = create_unique_run_dir(args.output_dir, suite_name)
+    write_json(suite_dir / "args.json", vars(args))
     results = []
     for architecture in args.architectures:
         for seed in args.seeds:
@@ -60,7 +67,7 @@ def main() -> None:
                 "--epochs", str(args.epochs),
                 "--device", args.device,
                 "--data-dir", str(args.data_dir),
-                "--output-dir", str(args.output_dir),
+                "--output-dir", str(suite_dir),
                 "--noop-eval-ratio", str(args.noop_eval_ratio),
             ]
             if args.no_progress:
@@ -96,20 +103,29 @@ def main() -> None:
             print(f"[run] architecture={architecture} seed={seed}", flush=True)
             results.append(run(parse_run_args(run_argv)))
 
-    aggregate_dir = args.output_dir / "aggregate"
+    aggregate_dir = suite_dir / "aggregate"
     raw_rows, summaries = aggregate_results(results, aggregate_dir)
     manifest = {
         "track": "original_team_plan_multiseed",
+        "suite_dir": str(suite_dir),
         "architectures": args.architectures,
         "seeds": sorted(set(args.seeds)),
         "position_encoding": args.position_encoding,
         "smoke": args.smoke,
-        "runs": [result["run_name"] for result in results],
+        "runs": [
+            {
+                "run_name": result["run_name"],
+                "run_id": result["run_id"],
+                "run_dir": result["run_dir"],
+                "result": result["paths"]["result"],
+            }
+            for result in results
+        ],
         "raw_rows": len(raw_rows),
         "summary_rows": len(summaries),
         "aggregate_dir": str(aggregate_dir),
     }
-    write_json(args.output_dir / "multiseed_manifest.json", manifest)
+    write_json(suite_dir / "manifest.json", manifest)
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
 
