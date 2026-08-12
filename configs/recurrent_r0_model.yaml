@@ -1,0 +1,43 @@
+# Pure R0 recurrent Transformer for the five-person ball-swap task.
+architecture: recurrent-r0
+position_encoding: sinusoidal
+d_model: 128
+n_heads: 4
+d_ff: 512
+dropout: 0.0
+num_loops: 6
+classifier_dim: 2
+
+# Main condition: h <- shared_block(h), no input reinjection.
+loop_conditioning: none
+residual_scale: 1.0
+recurrent_blocks: 1
+max_loop_embeddings: 64
+
+adaptive_halting:
+  enabled_at_evaluation: false
+  signal: output_symmetric_kl_confidence_update_ratio
+  threshold: 0.001
+  update_threshold: 0.05
+  min_confidence: 0.7
+  min_loops: 2
+  patience: 2
+
+ablations:
+  deep_supervision_weight: 0.0
+  noop_eval_ratio: 0.0
+
+training:
+  epochs: 30
+  batch_size: 128
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  seeds: [0, 1, 2]
+  random_loops: false
+
+evaluation:
+  splits: [id_test, ood_x4, ood_x8]
+  metrics: [slot_accuracy, exact_match, exact_match_by_swaps]
+  loop_counts: [1, 2, 4, 6, 8, 12, 16, 24]

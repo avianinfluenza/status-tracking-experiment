@@ -22,6 +22,7 @@ from src.original.model import (
     DirectTransformer,
     ExplicitCoTTransformer,
     OriginalModelConfig,
+    RecurrentR0Transformer,
     RecurrentTransformer,
 )
 from src.trainer import config_to_argv
@@ -84,6 +85,52 @@ def test_recurrent_update_is_exactly_embedding_plus_block_output() -> None:
     updated = model.recurrent_step(e, h, batch["attn_mask"], positions)
     expected = e * batch["attn_mask"].unsqueeze(-1)
     torch.testing.assert_close(updated, expected)
+
+
+def test_recurrent_r0_update_does_not_reinject_embedding() -> None:
+    batch = collate_fn([sample_row()])
+    model = RecurrentR0Transformer(tiny_config("recurrent-r0"))
+    model.shared_block = ZeroBlock()
+    _, h, positions = model.prepare(batch["input_ids"], batch["attn_mask"])
+    updated = model.recurrent_step(
+        h, batch["attn_mask"], positions, loop_index=0
+    )
+    torch.testing.assert_close(updated, torch.zeros_like(h))
+
+
+def test_recurrent_r0_loop_conditioning_is_explicit_ablation() -> None:
+    batch = collate_fn([sample_row()])
+    model = RecurrentR0Transformer(tiny_config("recurrent-r0"))
+    conditioned = RecurrentR0Transformer(
+        OriginalModelConfig(
+            **{
+                **tiny_config("recurrent-r0").to_dict(),
+                "loop_conditioning": "learned",
+                "max_loop_embeddings": 4,
+            }
+        )
+    )
+    plain_logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+    conditioned_logits = conditioned(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+    assert plain_logits.shape == conditioned_logits.shape == (1, 5, 5)
+
+
+def test_recurrent_r0_adaptive_halting_reports_confidence_and_update_ratio() -> None:
+    batch = collate_fn([sample_row(), sample_row()])
+    model = RecurrentR0Transformer(tiny_config("recurrent-r0"))
+    logits, diagnostics = model.forward_adaptive(
+        batch["input_ids"], batch["attn_mask"], batch["slot_pos"], max_loops=3
+    )
+    assert logits.shape == (2, 5, 5)
+    assert set(diagnostics) == {
+        "steps_taken",
+        "halted",
+        "symmetric_kl",
+        "update_ratio",
+        "confidence",
+    }
+    assert diagnostics["update_ratio"].shape == (2, 3)
+    assert diagnostics["confidence"].shape == (2, 3)
 
 
 def test_adaptive_recurrence_uses_kl_only_and_halts_stable_outputs() -> None:
@@ -230,4 +277,37 @@ def test_team_yaml_config_maps_to_canonical_trainer_cli() -> None:
     assert arguments[:2] == ["--architecture", "recurrent"]
     assert "--position-encoding" in arguments
     assert "rope" in arguments
+    assert "--adaptive-kl-eval" in arguments
+
+
+def test_r0_yaml_config_maps_advanced_ball_swap_options() -> None:
+    arguments = config_to_argv({
+        "architecture": "r0",
+        "num_loops": 6,
+        "loop_conditioning": "learned",
+        "residual_scale": 0.5,
+        "recurrent_blocks": 2,
+        "training": {
+            "epochs": 1,
+            "batch_size": 8,
+            "seed": 3,
+            "random_loops": True,
+            "random_min_loops": 2,
+            "random_max_loops": 6,
+        },
+        "adaptive_halting": {
+            "enabled_at_evaluation": True,
+            "threshold": 0.01,
+            "update_threshold": 0.05,
+            "min_confidence": 0.7,
+            "min_loops": 2,
+            "patience": 2,
+        },
+        "evaluation": {"loop_counts": [1, 2, 4, 6, 8]},
+    })
+    assert arguments[:2] == ["--architecture", "recurrent-r0"]
+    assert "--loop-conditioning" in arguments
+    assert "learned" in arguments
+    assert "--random-loops" in arguments
+    assert "--eval-loop-counts" in arguments
     assert "--adaptive-kl-eval" in arguments

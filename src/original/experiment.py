@@ -29,6 +29,7 @@ from .model import (
     ExplicitCoTTransformer,
     OriginalModel,
     OriginalModelConfig,
+    RecurrentR0Transformer,
     RecurrentTransformer,
     build_model,
     count_parameters,
@@ -90,6 +91,10 @@ def move_tensors(batch: dict[str, Tensor], device: torch.device) -> dict[str, Te
     return {key: value.to(device) for key, value in batch.items()}
 
 
+def _supports_loop_override(model: OriginalModel) -> bool:
+    return isinstance(model, (RecurrentTransformer, RecurrentR0Transformer))
+
+
 def train_epoch(
     model: OriginalModel,
     loader: DataLoader,
@@ -97,12 +102,18 @@ def train_epoch(
     device: torch.device,
     grad_clip: float,
     deep_supervision_weight: float = 0.0,
+    random_loop_range: tuple[int, int] | None = None,
 ) -> float:
     model.train()
     weighted_loss = 0.0
     target_count = 0
     for batch_cpu in loader:
         batch = move_tensors(batch_cpu, device)
+        sampled_loops = None
+        if random_loop_range is not None:
+            if not isinstance(model, RecurrentR0Transformer):
+                raise ValueError("random-loop training is available only for recurrent-r0")
+            sampled_loops = random.randint(*random_loop_range)
         if isinstance(model, ExplicitCoTTransformer):
             logits = model(batch["input_ids"], batch["attention_mask"])
             targets = batch["lm_labels"]
@@ -111,9 +122,12 @@ def train_epoch(
                 targets.reshape(-1),
                 ignore_index=-100,
             )
-        elif isinstance(model, RecurrentTransformer) and deep_supervision_weight > 0.0:
+        elif _supports_loop_override(model) and deep_supervision_weight > 0.0:
             loop_logits = model.forward_all_loops(
-                batch["input_ids"], batch["attn_mask"], batch["slot_pos"]
+                batch["input_ids"],
+                batch["attn_mask"],
+                batch["slot_pos"],
+                num_loops=sampled_loops,
             )
             targets = batch["labels"]
             final_logits = loop_logits[:, -1]
@@ -134,7 +148,15 @@ def train_epoch(
             else:
                 loss = final_loss
         else:
-            logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+            if sampled_loops is not None:
+                logits = model(
+                    batch["input_ids"],
+                    batch["attn_mask"],
+                    batch["slot_pos"],
+                    num_loops=sampled_loops,
+                )
+            else:
+                logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
             targets = batch["labels"]
             loss = F.cross_entropy(
                 logits.reshape(-1, logits.shape[-1]),
@@ -199,25 +221,35 @@ def _empty_totals() -> dict[str, object]:
 
 @torch.inference_mode()
 def evaluate_classifier(
-    model: DirectTransformer | RecurrentTransformer,
+    model: DirectTransformer | RecurrentTransformer | RecurrentR0Transformer,
     loader: DataLoader,
     device: torch.device,
     *,
     adaptive_kl: bool,
+    num_loops: int | None = None,
 ) -> dict[str, object]:
     model.eval()
+    if num_loops is not None and not _supports_loop_override(model):
+        raise ValueError("num_loops evaluation is available only for recurrent models")
     totals = _empty_totals()
     step_sum = 0
     halt_sum = 0
     final_kl_sum = 0.0
     final_kl_count = 0
+    final_update_sum = 0.0
+    final_update_count = 0
+    final_confidence_sum = 0.0
+    final_confidence_count = 0
     for batch_cpu in loader:
         batch = move_tensors(batch_cpu, device)
         if adaptive_kl:
-            if not isinstance(model, RecurrentTransformer):
-                raise ValueError("KL halting is available only for the recurrent model")
+            if not _supports_loop_override(model):
+                raise ValueError("adaptive halting is available only for recurrent models")
             logits, diagnostics = model.forward_adaptive(
-                batch["input_ids"], batch["attn_mask"], batch["slot_pos"]
+                batch["input_ids"],
+                batch["attn_mask"],
+                batch["slot_pos"],
+                max_loops=num_loops,
             )
             step_sum += int(diagnostics["steps_taken"].sum().item())
             halt_sum += int(diagnostics["halted"].sum().item())
@@ -226,10 +258,30 @@ def evaluate_classifier(
             finite = torch.isfinite(final_kl)
             final_kl_sum += float(final_kl[finite].sum().item())
             final_kl_count += int(finite.sum().item())
+            if "update_ratio" in diagnostics:
+                final_update = diagnostics["update_ratio"].gather(1, indices).squeeze(1)
+                finite_update = torch.isfinite(final_update)
+                final_update_sum += float(final_update[finite_update].sum().item())
+                final_update_count += int(finite_update.sum().item())
+            if "confidence" in diagnostics:
+                final_confidence = diagnostics["confidence"].gather(1, indices).squeeze(1)
+                finite_confidence = torch.isfinite(final_confidence)
+                final_confidence_sum += float(final_confidence[finite_confidence].sum().item())
+                final_confidence_count += int(finite_confidence.sum().item())
         else:
-            logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+            if num_loops is not None:
+                logits = model(
+                    batch["input_ids"],
+                    batch["attn_mask"],
+                    batch["slot_pos"],
+                    num_loops=num_loops,
+                )
+            else:
+                logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
         _accumulate_metrics(logits.argmax(-1), batch["labels"], batch["n_swaps"], totals)
     metrics = _finish_metrics(totals)
+    if num_loops is not None:
+        metrics["num_loops"] = num_loops
     if adaptive_kl:
         samples = int(metrics["n_samples"])
         metrics.update(
@@ -237,9 +289,17 @@ def evaluate_classifier(
                 "average_loops": step_sum / max(samples, 1),
                 "halt_rate": halt_sum / max(samples, 1),
                 "final_symmetric_kl": final_kl_sum / max(final_kl_count, 1),
-                "halting_signal": "output_symmetric_kl_only",
+                "halting_signal": (
+                    "output_symmetric_kl_confidence_update_ratio"
+                    if isinstance(model, RecurrentR0Transformer)
+                    else "output_symmetric_kl_only"
+                ),
             }
         )
+        if final_update_count:
+            metrics["final_update_ratio"] = final_update_sum / final_update_count
+        if final_confidence_count:
+            metrics["final_confidence"] = final_confidence_sum / final_confidence_count
     return metrics
 
 
@@ -292,7 +352,11 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--architecture", choices=("direct", "cot", "recurrent"), required=True)
+    parser.add_argument(
+        "--architecture",
+        choices=("direct", "cot", "recurrent", "recurrent-r0"),
+        required=True,
+    )
     parser.add_argument("--position-encoding", choices=("sinusoidal", "rope"), default="sinusoidal")
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
@@ -303,13 +367,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.0)
     parser.add_argument("--adaptive-kl-eval", action="store_true")
     parser.add_argument("--kl-threshold", type=float, default=1e-3)
+    parser.add_argument("--adaptive-update-threshold", type=float, default=1e9)
+    parser.add_argument("--adaptive-min-confidence", type=float, default=0.0)
     parser.add_argument("--min-loops", type=int, default=2)
     parser.add_argument("--halting-patience", type=int, default=1)
+    parser.add_argument("--loop-conditioning", choices=("none", "learned"), default="none")
+    parser.add_argument("--residual-scale", type=float, default=1.0)
+    parser.add_argument("--recurrent-blocks", type=int, default=1)
+    parser.add_argument("--max-loop-embeddings", type=int, default=64)
+    parser.add_argument("--random-loops", action="store_true")
+    parser.add_argument("--random-min-loops", type=int, default=None)
+    parser.add_argument("--random-max-loops", type=int, default=None)
+    parser.add_argument("--eval-loop-counts", type=int, nargs="+", default=None)
     parser.add_argument(
         "--deep-supervision-weight",
         type=float,
         default=0.0,
-        help="optional recurrent ablation: CE on every non-final loop",
+        help="optional recurrent ablation: final-state CE on every non-final loop",
     )
     parser.add_argument(
         "--noop-eval-ratio",
@@ -335,14 +409,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
-    if args.adaptive_kl_eval and args.architecture != "recurrent":
-        raise ValueError("--adaptive-kl-eval requires --architecture recurrent")
+    recurrent_architectures = {"recurrent", "recurrent-r0"}
+    if args.adaptive_kl_eval and args.architecture not in recurrent_architectures:
+        raise ValueError("--adaptive-kl-eval requires a recurrent architecture")
     if args.deep_supervision_weight < 0.0:
         raise ValueError("--deep-supervision-weight must be non-negative")
-    if args.deep_supervision_weight > 0.0 and args.architecture != "recurrent":
+    if args.deep_supervision_weight > 0.0 and args.architecture not in recurrent_architectures:
         raise ValueError("deep supervision is available only for the recurrent model")
+    advanced_r0_requested = (
+        args.loop_conditioning != "none"
+        or args.residual_scale != 1.0
+        or args.recurrent_blocks != 1
+        or args.random_loops
+    )
+    if advanced_r0_requested and args.architecture != "recurrent-r0":
+        raise ValueError("loop-conditioning, residual-scale, recurrent-blocks, and random-loops require recurrent-r0")
+    if args.eval_loop_counts and args.architecture not in recurrent_architectures:
+        raise ValueError("--eval-loop-counts requires a recurrent architecture")
     if args.noop_eval_ratio < 0.0:
         raise ValueError("--noop-eval-ratio must be non-negative")
+    if args.random_loops:
+        random_min = args.random_min_loops if args.random_min_loops is not None else max(1, args.num_loops // 2)
+        random_max = args.random_max_loops if args.random_max_loops is not None else args.num_loops
+        if not 1 <= random_min <= random_max:
+            raise ValueError("random loop range must satisfy 1 <= min <= max")
+    else:
+        random_min = random_max = None
     if args.smoke:
         args.epochs = 1
         args.d_model = 32
@@ -351,6 +443,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.num_layers = 2
         args.num_loops = 2
         args.min_loops = min(args.min_loops, args.num_loops)
+        if args.random_loops:
+            random_min = 1
+            random_max = args.num_loops
         args.batch_size = 8
         args.eval_batch_size = 4
         args.max_train_samples = 16
@@ -371,6 +466,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         kl_threshold=args.kl_threshold,
         min_loops=args.min_loops,
         halting_patience=args.halting_patience,
+        loop_conditioning=args.loop_conditioning,
+        residual_scale=args.residual_scale,
+        recurrent_blocks=args.recurrent_blocks,
+        max_loop_embeddings=args.max_loop_embeddings,
+        adaptive_update_threshold=args.adaptive_update_threshold,
+        adaptive_min_confidence=args.adaptive_min_confidence,
     )
     model = build_model(config).to(device)
     train_loader = make_loader(
@@ -393,6 +494,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 device,
                 args.grad_clip,
                 deep_supervision_weight=args.deep_supervision_weight,
+                random_loop_range=(random_min, random_max) if args.random_loops else None,
             )
         )
     training_seconds = time.perf_counter() - started
@@ -418,6 +520,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 device,
                 adaptive_kl=args.adaptive_kl_eval,
             )
+            if args.eval_loop_counts:
+                metrics["loop_sweep"] = {
+                    str(loop_count): evaluate_classifier(
+                        model,
+                        loader,
+                        device,
+                        adaptive_kl=False,
+                        num_loops=loop_count,
+                    )
+                    for loop_count in args.eval_loop_counts
+                }
         split_metrics[split] = metrics
 
     if args.noop_eval_ratio > 0.0:
@@ -450,6 +563,17 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 device,
                 adaptive_kl=args.adaptive_kl_eval,
             )
+            if args.eval_loop_counts:
+                split_metrics[split_name]["loop_sweep"] = {
+                    str(loop_count): evaluate_classifier(
+                        model,
+                        noisy_loader,
+                        device,
+                        adaptive_kl=False,
+                        num_loops=loop_count,
+                    )
+                    for loop_count in args.eval_loop_counts
+                }
 
     if args.run_name:
         run_name = args.run_name
@@ -459,6 +583,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             name_parts.append(f"ds{args.deep_supervision_weight:g}")
         if args.noop_eval_ratio > 0.0:
             name_parts.append(f"noop{args.noop_eval_ratio:g}")
+        if args.architecture == "recurrent-r0":
+            if args.loop_conditioning != "none":
+                name_parts.append(f"loop{args.loop_conditioning}")
+            if args.residual_scale != 1.0:
+                name_parts.append(f"rs{args.residual_scale:g}")
+            if args.recurrent_blocks != 1:
+                name_parts.append(f"blocks{args.recurrent_blocks}")
+            if args.random_loops:
+                name_parts.append("randomloops")
         if args.adaptive_kl_eval:
             name_parts.append("adaptive")
         run_name = "-".join(name_parts)
@@ -473,6 +606,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "ablations": {
             "deep_supervision_weight": args.deep_supervision_weight,
             "noop_eval_ratio": args.noop_eval_ratio,
+            "loop_conditioning": args.loop_conditioning,
+            "residual_scale": args.residual_scale,
+            "recurrent_blocks": args.recurrent_blocks,
+            "random_loops": args.random_loops,
+            "random_loop_range": [random_min, random_max] if args.random_loops else None,
+            "eval_loop_counts": args.eval_loop_counts,
+            "adaptive_update_threshold": args.adaptive_update_threshold,
+            "adaptive_min_confidence": args.adaptive_min_confidence,
         },
         "splits": split_metrics,
     }

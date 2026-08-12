@@ -23,8 +23,9 @@ from .data import (
 )
 
 
-Architecture = Literal["direct", "cot", "recurrent"]
+Architecture = Literal["direct", "cot", "recurrent", "recurrent-r0"]
 PositionEncoding = Literal["sinusoidal", "rope"]
+LoopConditioning = Literal["none", "learned"]
 
 
 @dataclass(frozen=True)
@@ -41,9 +42,15 @@ class OriginalModelConfig:
     kl_threshold: float = 1e-3
     min_loops: int = 2
     halting_patience: int = 1
+    loop_conditioning: LoopConditioning = "none"
+    residual_scale: float = 1.0
+    recurrent_blocks: int = 1
+    max_loop_embeddings: int = 64
+    adaptive_update_threshold: float = 1e9
+    adaptive_min_confidence: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.architecture not in ("direct", "cot", "recurrent"):
+        if self.architecture not in ("direct", "cot", "recurrent", "recurrent-r0"):
             raise ValueError(f"unknown architecture: {self.architecture}")
         if self.position_encoding not in ("sinusoidal", "rope"):
             raise ValueError(f"unknown position encoding: {self.position_encoding}")
@@ -63,6 +70,18 @@ class OriginalModelConfig:
             raise ValueError("min_loops must be in [1, num_loops]")
         if self.halting_patience < 1:
             raise ValueError("halting_patience must be positive")
+        if self.loop_conditioning not in ("none", "learned"):
+            raise ValueError(f"unknown loop conditioning: {self.loop_conditioning}")
+        if not 0.0 < self.residual_scale <= 1.0:
+            raise ValueError("residual_scale must be in (0, 1]")
+        if not 1 <= self.recurrent_blocks <= self.num_loops:
+            raise ValueError("recurrent_blocks must be in [1, num_loops]")
+        if self.max_loop_embeddings < self.num_loops:
+            raise ValueError("max_loop_embeddings must cover training loops")
+        if self.adaptive_update_threshold < 0.0:
+            raise ValueError("adaptive_update_threshold must be non-negative")
+        if not 0.0 <= self.adaptive_min_confidence <= 1.0:
+            raise ValueError("adaptive_min_confidence must be in [0, 1]")
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -405,6 +424,179 @@ class RecurrentTransformer(TokenBackbone):
         }
 
 
+class RecurrentR0Transformer(TokenBackbone):
+    """Pure weight-tied recurrence for ball-swap final-state prediction.
+
+    R0 is the main condition: ``h <- shared_block(h)`` with no input
+    reinjection and no loop identity.  Loop embeddings, residual scaling, and
+    multi-block sharing are explicit ablations configured on the model config.
+    """
+
+    def __init__(self, config: OriginalModelConfig) -> None:
+        if config.architecture != "recurrent-r0":
+            raise ValueError("RecurrentR0Transformer requires architecture='recurrent-r0'")
+        super().__init__(config, VOCAB_SIZE)
+        if config.recurrent_blocks == 1:
+            self.shared_block = TransformerBlock(config)
+        else:
+            self.recurrent_blocks = nn.ModuleList(
+                TransformerBlock(config) for _ in range(config.recurrent_blocks)
+            )
+        self.loop_embedding = (
+            nn.Embedding(config.max_loop_embeddings, config.d_model)
+            if config.loop_conditioning == "learned"
+            else None
+        )
+        self.classifier = Classifier(config.d_model, config.classifier_dim, N_LABELS)
+
+    def _block_for_step(self, loop_index: int) -> TransformerBlock:
+        if self.config.recurrent_blocks == 1:
+            return self.shared_block
+        return self.recurrent_blocks[loop_index % self.config.recurrent_blocks]
+
+    def recurrent_step(
+        self,
+        h: Tensor,
+        attention_mask: Tensor,
+        position_ids: Tensor,
+        *,
+        loop_index: int,
+    ) -> Tensor:
+        conditioned = h
+        if self.loop_embedding is not None:
+            if loop_index >= self.config.max_loop_embeddings:
+                raise ValueError("loop count exceeds max_loop_embeddings")
+            conditioned = conditioned + self.loop_embedding.weight[loop_index].view(1, 1, -1)
+        candidate = self._block_for_step(loop_index)(
+            conditioned, attention_mask, position_ids, causal=False
+        )
+        if self.config.residual_scale != 1.0:
+            candidate = h + self.config.residual_scale * (candidate - h)
+        return candidate * attention_mask.unsqueeze(-1).to(dtype=candidate.dtype)
+
+    def _classify(self, h: Tensor, attention_mask: Tensor, slot_positions: Tensor) -> Tensor:
+        normalized = self.final_norm(h) * attention_mask.unsqueeze(-1)
+        return self.classifier(_gather_slots(normalized, slot_positions))
+
+    def _slot_states(self, h: Tensor, attention_mask: Tensor, slot_positions: Tensor) -> Tensor:
+        normalized = self.final_norm(h) * attention_mask.unsqueeze(-1)
+        return _gather_slots(normalized, slot_positions)
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        slot_positions: Tensor,
+        *,
+        num_loops: int | None = None,
+    ) -> Tensor:
+        return self.forward_all_loops(
+            input_ids,
+            attention_mask,
+            slot_positions,
+            num_loops=num_loops,
+        )[:, -1]
+
+    def forward_all_loops(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        slot_positions: Tensor,
+        *,
+        num_loops: int | None = None,
+    ) -> Tensor:
+        _, h, positions = self.prepare(input_ids, attention_mask)
+        loops = self.config.num_loops if num_loops is None else num_loops
+        if loops < 1:
+            raise ValueError("num_loops must be positive")
+        outputs = []
+        for loop_index in range(loops):
+            h = self.recurrent_step(
+                h, attention_mask, positions, loop_index=loop_index
+            )
+            outputs.append(self._classify(h, attention_mask, slot_positions))
+        return torch.stack(outputs, dim=1)
+
+    @torch.inference_mode()
+    def forward_adaptive(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        slot_positions: Tensor,
+        *,
+        max_loops: int | None = None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Stop samples using KL, confidence, update ratio, and patience."""
+
+        _, h, positions = self.prepare(input_ids, attention_mask)
+        loops = self.config.num_loops if max_loops is None else max_loops
+        if loops < self.config.min_loops:
+            raise ValueError("max_loops must be at least min_loops")
+        batch_size = input_ids.shape[0]
+        active = torch.ones(batch_size, dtype=torch.bool, device=input_ids.device)
+        streak = torch.zeros(batch_size, dtype=torch.long, device=input_ids.device)
+        steps_taken = torch.full((batch_size,), loops, dtype=torch.long, device=input_ids.device)
+        halted = torch.zeros(batch_size, dtype=torch.bool, device=input_ids.device)
+        kl_history = torch.full((batch_size, loops), torch.inf, device=input_ids.device)
+        update_history = torch.full((batch_size, loops), torch.inf, device=input_ids.device)
+        confidence_history = torch.zeros((batch_size, loops), device=input_ids.device)
+        previous_probabilities: Tensor | None = None
+        final_logits: Tensor | None = None
+
+        for loop_index in range(loops):
+            previous_slots = self._slot_states(h, attention_mask, slot_positions)
+            candidate = self.recurrent_step(
+                h, attention_mask, positions, loop_index=loop_index
+            )
+            h = torch.where(active[:, None, None], candidate, h)
+            current_slots = self._slot_states(h, attention_mask, slot_positions)
+            delta = (current_slots - previous_slots).norm(dim=-1)
+            base = previous_slots.norm(dim=-1).clamp_min(1e-8)
+            update_ratio = (delta / base).mean(dim=-1)
+            update_history[:, loop_index] = update_ratio
+
+            logits = self._classify(h, attention_mask, slot_positions)
+            probabilities = logits.softmax(dim=-1)
+            confidence = probabilities.amax(dim=-1).mean(dim=-1)
+            confidence_history[:, loop_index] = confidence
+            if final_logits is None:
+                final_logits = logits.clone()
+            final_logits = torch.where(active[:, None, None], logits, final_logits)
+
+            if previous_probabilities is not None:
+                kl = symmetric_output_kl(probabilities, previous_probabilities)
+                kl_history[:, loop_index] = kl
+                eligible = loop_index + 1 >= self.config.min_loops
+                stable = (
+                    (kl <= self.config.kl_threshold)
+                    & (update_ratio <= self.config.adaptive_update_threshold)
+                    & (confidence >= self.config.adaptive_min_confidence)
+                    & active
+                    if eligible else torch.zeros_like(active)
+                )
+                streak = torch.where(stable, streak + 1, torch.zeros_like(streak))
+                newly_halted = active & (streak >= self.config.halting_patience)
+                steps_taken = torch.where(
+                    newly_halted,
+                    torch.full_like(steps_taken, loop_index + 1),
+                    steps_taken,
+                )
+                halted |= newly_halted
+                active &= ~newly_halted
+            previous_probabilities = probabilities
+            if not bool(active.any()):
+                break
+
+        assert final_logits is not None
+        return final_logits, {
+            "steps_taken": steps_taken,
+            "halted": halted,
+            "symmetric_kl": kl_history,
+            "update_ratio": update_history,
+            "confidence": confidence_history,
+        }
+
+
 class ExplicitCoTTransformer(TokenBackbone):
     """Causal Transformer that externalizes the full state after every swap."""
 
@@ -494,7 +686,12 @@ class ExplicitCoTTransformer(TokenBackbone):
         return final_predictions
 
 
-OriginalModel = DirectTransformer | ExplicitCoTTransformer | RecurrentTransformer
+OriginalModel = (
+    DirectTransformer
+    | ExplicitCoTTransformer
+    | RecurrentTransformer
+    | RecurrentR0Transformer
+)
 
 
 def build_model(config: OriginalModelConfig) -> OriginalModel:
@@ -502,6 +699,8 @@ def build_model(config: OriginalModelConfig) -> OriginalModel:
         return DirectTransformer(config)
     if config.architecture == "cot":
         return ExplicitCoTTransformer(config)
+    if config.architecture == "recurrent-r0":
+        return RecurrentR0Transformer(config)
     return RecurrentTransformer(config)
 
 

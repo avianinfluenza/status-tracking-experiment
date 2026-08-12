@@ -26,10 +26,13 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
         "basic_transformer": "direct",
         "looped": "recurrent",
         "looped_transformer": "recurrent",
+        "r0": "recurrent-r0",
+        "recurrent_r0": "recurrent-r0",
+        "looped_r0": "recurrent-r0",
     }
     architecture = aliases.get(str(architecture).lower(), architecture)
-    if architecture not in ("direct", "cot", "recurrent"):
-        raise ValueError("config architecture must be direct, cot, or recurrent")
+    if architecture not in ("direct", "cot", "recurrent", "recurrent-r0"):
+        raise ValueError("config architecture must be direct, cot, recurrent, or recurrent-r0")
 
     arguments = ["--architecture", str(architecture)]
     _append(arguments, "--position-encoding", config.get("position_encoding", model.get("position_encoding")))
@@ -55,11 +58,25 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
     _append(arguments, "--data-dir", config.get("data_dir"))
     _append(arguments, "--output-dir", config.get("output_dir"))
     _append(arguments, "--kl-threshold", halting.get("threshold"))
+    _append(arguments, "--adaptive-update-threshold", halting.get("update_threshold"))
+    _append(arguments, "--adaptive-min-confidence", halting.get("min_confidence"))
     _append(arguments, "--min-loops", halting.get("min_loops"))
     _append(arguments, "--halting-patience", halting.get("patience"))
+    _append(arguments, "--loop-conditioning", config.get("loop_conditioning", model.get("loop_conditioning")))
+    _append(arguments, "--residual-scale", config.get("residual_scale", model.get("residual_scale")))
+    _append(arguments, "--recurrent-blocks", config.get("recurrent_blocks", model.get("recurrent_blocks")))
+    _append(arguments, "--max-loop-embeddings", config.get("max_loop_embeddings", model.get("max_loop_embeddings")))
+    if config.get("random_loops") or training.get("random_loops"):
+        arguments.append("--random-loops")
+    _append(arguments, "--random-min-loops", training.get("random_min_loops"))
+    _append(arguments, "--random-max-loops", training.get("random_max_loops"))
+    loop_counts = config.get("eval_loop_counts") or dict(config.get("evaluation") or {}).get("loop_counts")
+    if loop_counts:
+        arguments.append("--eval-loop-counts")
+        arguments.extend(map(str, loop_counts))
     _append(arguments, "--deep-supervision-weight", ablations.get("deep_supervision_weight"))
     _append(arguments, "--noop-eval-ratio", ablations.get("noop_eval_ratio"))
-    if architecture == "recurrent" and halting.get("enabled_at_evaluation"):
+    if architecture in ("recurrent", "recurrent-r0") and halting.get("enabled_at_evaluation"):
         arguments.append("--adaptive-kl-eval")
     if config.get("smoke"):
         arguments.append("--smoke")
