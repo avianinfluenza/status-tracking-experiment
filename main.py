@@ -24,6 +24,7 @@ def parse_config_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int)
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
@@ -53,6 +54,8 @@ def override_config(config: dict[str, object], args: argparse.Namespace) -> dict
         result["data_dir"] = str(args.data_dir)
     if args.output_dir is not None:
         result["output_dir"] = str(args.output_dir)
+    if args.no_progress:
+        result["progress"] = False
     if args.smoke:
         result["smoke"] = True
     result["training"] = training

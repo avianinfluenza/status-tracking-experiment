@@ -41,6 +41,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--random-loops", action="store_true")
     parser.add_argument("--random-min-loops", type=int, default=None)
     parser.add_argument("--random-max-loops", type=int, default=None)
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args()
 
@@ -62,6 +63,8 @@ def main() -> None:
                 "--output-dir", str(args.output_dir),
                 "--noop-eval-ratio", str(args.noop_eval_ratio),
             ]
+            if args.no_progress:
+                run_argv.append("--no-progress")
             if architecture in ("recurrent", "recurrent-r0"):
                 run_argv.extend(
                     ["--deep-supervision-weight", str(args.deep_supervision_weight)]

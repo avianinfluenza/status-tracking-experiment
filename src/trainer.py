@@ -78,6 +78,8 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
     _append(arguments, "--noop-eval-ratio", ablations.get("noop_eval_ratio"))
     if architecture in ("recurrent", "recurrent-r0") and halting.get("enabled_at_evaluation"):
         arguments.append("--adaptive-kl-eval")
+    if config.get("progress") is False:
+        arguments.append("--no-progress")
     if config.get("smoke"):
         arguments.append("--smoke")
     return arguments

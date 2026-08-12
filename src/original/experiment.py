@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader, Dataset, Subset
+from tqdm.auto import tqdm
 
 from ..data.collate import BallSwapDataset, collate_fn
 from .data import (
@@ -95,6 +96,24 @@ def _supports_loop_override(model: OriginalModel) -> bool:
     return isinstance(model, (RecurrentTransformer, RecurrentR0Transformer))
 
 
+def _progress_bar(
+    iterable: Iterable,
+    *,
+    total: int,
+    desc: str,
+    leave: bool,
+    position: int,
+):
+    return tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        leave=leave,
+        position=position,
+        dynamic_ncols=True,
+    )
+
+
 def train_epoch(
     model: OriginalModel,
     loader: DataLoader,
@@ -103,74 +122,95 @@ def train_epoch(
     grad_clip: float,
     deep_supervision_weight: float = 0.0,
     random_loop_range: tuple[int, int] | None = None,
+    epoch: int | None = None,
+    show_progress: bool = False,
 ) -> float:
     model.train()
     weighted_loss = 0.0
     target_count = 0
-    for batch_cpu in loader:
-        batch = move_tensors(batch_cpu, device)
-        sampled_loops = None
-        if random_loop_range is not None:
-            if not isinstance(model, RecurrentR0Transformer):
-                raise ValueError("random-loop training is available only for recurrent-r0")
-            sampled_loops = random.randint(*random_loop_range)
-        if isinstance(model, ExplicitCoTTransformer):
-            logits = model(batch["input_ids"], batch["attention_mask"])
-            targets = batch["lm_labels"]
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                targets.reshape(-1),
-                ignore_index=-100,
-            )
-        elif _supports_loop_override(model) and deep_supervision_weight > 0.0:
-            loop_logits = model.forward_all_loops(
-                batch["input_ids"],
-                batch["attn_mask"],
-                batch["slot_pos"],
-                num_loops=sampled_loops,
-            )
-            targets = batch["labels"]
-            final_logits = loop_logits[:, -1]
-            final_loss = F.cross_entropy(
-                final_logits.reshape(-1, final_logits.shape[-1]),
-                targets.reshape(-1),
-                ignore_index=-100,
-            )
-            if loop_logits.shape[1] > 1:
-                intermediate = loop_logits[:, :-1]
-                repeated_targets = targets[:, None].expand(-1, intermediate.shape[1], -1)
-                intermediate_loss = F.cross_entropy(
-                    intermediate.reshape(-1, intermediate.shape[-1]),
-                    repeated_targets.reshape(-1),
+    progress = None
+    batches: Iterable = loader
+    if show_progress:
+        desc = f"epoch {epoch}" if epoch is not None else "epoch"
+        progress = _progress_bar(
+            loader,
+            total=len(loader),
+            desc=desc,
+            leave=False,
+            position=1,
+        )
+        batches = progress
+    try:
+        for batch_cpu in batches:
+            batch = move_tensors(batch_cpu, device)
+            sampled_loops = None
+            if random_loop_range is not None:
+                if not isinstance(model, RecurrentR0Transformer):
+                    raise ValueError("random-loop training is available only for recurrent-r0")
+                sampled_loops = random.randint(*random_loop_range)
+            if isinstance(model, ExplicitCoTTransformer):
+                logits = model(batch["input_ids"], batch["attention_mask"])
+                targets = batch["lm_labels"]
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    targets.reshape(-1),
                     ignore_index=-100,
                 )
-                loss = final_loss + deep_supervision_weight * intermediate_loss
-            else:
-                loss = final_loss
-        else:
-            if sampled_loops is not None:
-                logits = model(
+            elif _supports_loop_override(model) and deep_supervision_weight > 0.0:
+                loop_logits = model.forward_all_loops(
                     batch["input_ids"],
                     batch["attn_mask"],
                     batch["slot_pos"],
                     num_loops=sampled_loops,
                 )
+                targets = batch["labels"]
+                final_logits = loop_logits[:, -1]
+                final_loss = F.cross_entropy(
+                    final_logits.reshape(-1, final_logits.shape[-1]),
+                    targets.reshape(-1),
+                    ignore_index=-100,
+                )
+                if loop_logits.shape[1] > 1:
+                    intermediate = loop_logits[:, :-1]
+                    repeated_targets = targets[:, None].expand(-1, intermediate.shape[1], -1)
+                    intermediate_loss = F.cross_entropy(
+                        intermediate.reshape(-1, intermediate.shape[-1]),
+                        repeated_targets.reshape(-1),
+                        ignore_index=-100,
+                    )
+                    loss = final_loss + deep_supervision_weight * intermediate_loss
+                else:
+                    loss = final_loss
             else:
-                logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
-            targets = batch["labels"]
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]),
-                targets.reshape(-1),
-                ignore_index=-100,
-            )
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        if grad_clip > 0:
-            clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
-        count = int((targets != -100).sum().item())
-        weighted_loss += float(loss.item()) * count
-        target_count += count
+                if sampled_loops is not None:
+                    logits = model(
+                        batch["input_ids"],
+                        batch["attn_mask"],
+                        batch["slot_pos"],
+                        num_loops=sampled_loops,
+                    )
+                else:
+                    logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+                targets = batch["labels"]
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.shape[-1]),
+                    targets.reshape(-1),
+                    ignore_index=-100,
+                )
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            if grad_clip > 0:
+                clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            count = int((targets != -100).sum().item())
+            weighted_loss += float(loss.item()) * count
+            target_count += count
+            if progress is not None:
+                running_loss = weighted_loss / max(target_count, 1)
+                progress.set_postfix(loss=f"{running_loss:.4f}")
+    finally:
+        if progress is not None:
+            progress.close()
     return weighted_loss / max(target_count, 1)
 
 
@@ -404,6 +444,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
+    parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args(argv)
 
@@ -485,18 +526,39 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     started = time.perf_counter()
     losses = []
-    for _epoch in range(1, args.epochs + 1):
-        losses.append(
-            train_epoch(
-                model,
-                train_loader,
-                optimizer,
-                device,
-                args.grad_clip,
-                deep_supervision_weight=args.deep_supervision_weight,
-                random_loop_range=(random_min, random_max) if args.random_loops else None,
-            )
+    show_progress = not args.no_progress
+    epoch_iterable: Iterable[int] = range(1, args.epochs + 1)
+    epoch_progress = None
+    if show_progress:
+        epoch_progress = _progress_bar(
+            epoch_iterable,
+            total=args.epochs,
+            desc=f"{args.architecture} seed{args.seed}",
+            leave=True,
+            position=0,
         )
+        epoch_iterable = epoch_progress
+    try:
+        for epoch in epoch_iterable:
+            loss = (
+                train_epoch(
+                    model,
+                    train_loader,
+                    optimizer,
+                    device,
+                    args.grad_clip,
+                    deep_supervision_weight=args.deep_supervision_weight,
+                    random_loop_range=(random_min, random_max) if args.random_loops else None,
+                    epoch=epoch,
+                    show_progress=show_progress,
+                )
+            )
+            losses.append(loss)
+            if epoch_progress is not None:
+                epoch_progress.set_postfix(loss=f"{loss:.4f}")
+    finally:
+        if epoch_progress is not None:
+            epoch_progress.close()
     training_seconds = time.perf_counter() - started
 
     split_metrics: dict[str, object] = {}
