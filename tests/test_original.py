@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+from argparse import Namespace
+import json
 
 import pytest
 import torch
@@ -17,7 +19,15 @@ from src.original.data import (
     inject_noop_swaps,
     replay_states,
 )
-from src.original.experiment import train_epoch
+from src.original.experiment import (
+    _prepare_run_outputs,
+    load_training_checkpoint,
+    rewrite_metrics_log,
+    save_training_checkpoint,
+    split_train_validation,
+    train_epoch,
+    validate_epoch,
+)
 from src.original.model import (
     DirectTransformer,
     ExplicitCoTTransformer,
@@ -231,3 +241,101 @@ def test_team_yaml_config_maps_to_canonical_trainer_cli() -> None:
     assert "--position-encoding" in arguments
     assert "rope" in arguments
     assert "--adaptive-kl-eval" in arguments
+
+
+def test_validation_split_is_deterministic_and_disjoint() -> None:
+    rows = []
+    for n_swaps in (2, 3, 4, 5):
+        rows.extend(dict(sample_row(), row_id=f"{n_swaps}-{index}", n_swaps=n_swaps)
+                    for index in range(10))
+    dataset = RowsDataset(rows)
+    train_a, validation_a = split_train_validation(
+        dataset, validation_ratio=0.2, seed=11, max_samples=None
+    )
+    train_b, validation_b = split_train_validation(
+        dataset, validation_ratio=0.2, seed=11, max_samples=None
+    )
+    assert train_a.indices == train_b.indices
+    assert validation_a.indices == validation_b.indices
+    assert len(validation_a) == 8
+    assert set(train_a.indices).isdisjoint(validation_a.indices)
+    validation_lengths = [dataset[index]["n_swaps"] for index in validation_a.indices]
+    assert {length: validation_lengths.count(length) for length in set(validation_lengths)} == {
+        2: 2, 3: 2, 4: 2, 5: 2,
+    }
+
+
+def test_validation_and_full_training_checkpoint_roundtrip(tmp_path) -> None:
+    rows = [sample_row(), sample_row()]
+    loader = DataLoader(RowsDataset(rows), batch_size=2, collate_fn=collate_fn)
+    model = DirectTransformer(tiny_config("direct"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=2)
+    metrics = validate_epoch(model, loader, torch.device("cpu"))
+    assert metrics["target_count"] == 10
+    checkpoint = tmp_path / "last.pt"
+    save_training_checkpoint(
+        checkpoint,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        scaler=None,
+        epoch=1,
+        history=[{"epoch": 1, "validation": metrics}],
+        best_validation_loss=float(metrics["loss"]),
+        best_epoch=1,
+        training_seconds=0.5,
+        run_config={"seed": 0},
+    )
+    loaded = load_training_checkpoint(checkpoint, torch.device("cpu"))
+    assert loaded["epoch"] == 1
+    assert loaded["optimizer_state"] is not None
+    assert loaded["scheduler_state"] is not None
+    assert loaded["best_epoch"] == 1
+
+
+def test_yaml_wires_training_infrastructure_options() -> None:
+    arguments = config_to_argv({
+        "architecture": "direct",
+        "training": {
+            "optimizer": "AdamW",
+            "scheduler": {"name": "cosine", "warmup_epochs": 2, "min_lr": 1e-6},
+        },
+        "validation": {"ratio": 0.15},
+        "checkpointing": {"save_every": 3, "resume": "auto", "overwrite": True},
+        "performance": {
+            "amp": True,
+            "num_workers": 2,
+            "pin_memory": True,
+            "persistent_workers": True,
+        },
+        "evaluation": {"batch_size": 64, "splits": ["id_test"]},
+    })
+    for flag in (
+        "--optimizer", "--scheduler", "--validation-ratio", "--checkpoint-every",
+        "--resume", "--amp", "--num-workers", "--pin-memory",
+        "--persistent-workers", "--eval-batch-size", "--eval-splits", "--overwrite",
+    ):
+        assert flag in arguments
+
+
+def test_resume_log_reconciliation_removes_duplicates(tmp_path) -> None:
+    path = tmp_path / "metrics.jsonl"
+    path.write_text('{"epoch": 99}\n{"epoch": 99}\n', encoding="utf-8")
+    history = [{"epoch": 1, "train_loss": 1.0}, {"epoch": 2, "train_loss": 0.5}]
+    rewrite_metrics_log(path, history)
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert records == history
+
+
+def test_existing_run_requires_resume_or_explicit_overwrite(tmp_path) -> None:
+    args = Namespace(output_dir=tmp_path, resume=None, overwrite=False)
+    run_dir, _checkpoints, _metrics, _result = _prepare_run_outputs(args, "test-run")
+    run_dir.mkdir(parents=True)
+    marker = run_dir / "keep.txt"
+    marker.write_text("existing", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        _prepare_run_outputs(args, "test-run")
+    args.overwrite = True
+    _prepare_run_outputs(args, "test-run")
+    assert not run_dir.exists()
