@@ -21,6 +21,8 @@ from src.original.data import (
 )
 from src.original.experiment import (
     _prepare_run_outputs,
+    InferenceComputeMeter,
+    evaluate_classifier,
     load_training_checkpoint,
     rewrite_metrics_log,
     save_training_checkpoint,
@@ -339,3 +341,36 @@ def test_existing_run_requires_resume_or_explicit_overwrite(tmp_path) -> None:
     args.overwrite = True
     _prepare_run_outputs(args, "test-run")
     assert not run_dir.exists()
+
+
+def test_runtime_inference_meter_counts_classifier_and_cot_generation_flops() -> None:
+    row = sample_row()
+    batch = collate_fn([row, row])
+    direct = DirectTransformer(tiny_config("direct")).eval()
+    with InferenceComputeMeter(direct, torch.device("cpu")) as meter:
+        meter.measure(lambda: direct(batch["input_ids"], batch["attn_mask"], batch["slot_pos"]))
+    direct_summary = meter.summary(n_samples=2)
+    assert direct_summary["flops"] > 0
+    assert direct_summary["forward_calls"] == 1
+
+    cot = ExplicitCoTTransformer(tiny_config("cot")).eval()
+    with InferenceComputeMeter(cot, torch.device("cpu")) as meter:
+        meter.measure(lambda: cot.generate_states([row]))
+    cot_summary = meter.summary(n_samples=1)
+    assert cot_summary["flops"] > 0
+    assert meter.attention_flops > 0
+
+
+def test_evaluation_persists_forward_compute_and_time_metrics() -> None:
+    rows = [sample_row(), sample_row()]
+    loader = DataLoader(RowsDataset(rows), batch_size=2, collate_fn=collate_fn)
+    result = evaluate_classifier(
+        DirectTransformer(tiny_config("direct")),
+        loader,
+        torch.device("cpu"),
+        adaptive_kl=False,
+    )
+    compute = result["inference_compute"]
+    assert isinstance(compute, dict)
+    assert compute["flops"] > 0
+    assert compute["inference_seconds"] >= 0.0

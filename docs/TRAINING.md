@@ -62,3 +62,10 @@ AMP is enabled only on CUDA even when requested. DataLoader worker count,
 pinned memory, persistent workers, optimizer, scheduler, validation ratio,
 evaluation batch size/splits/metrics, and checkpoint frequency are all wired
 from the YAML files into the canonical trainer.
+
+Every final ID/OOD evaluation also writes forward-only compute and time under
+`splits.<split>.inference_compute`. The runtime count covers all linear
+projections plus attention `QK^T` and `AV` matrix multiplications using actual
+batch/sequence/cache shapes. It excludes embedding, normalisation, softmax,
+activations, masking, and other elementwise operations; the exact convention is
+stored with each result.

@@ -260,6 +260,33 @@ performance:
 - worker 프로세스를 epoch 사이에 유지 가능
 - epoch별 shuffle 순서는 `seed + epoch`으로 결정되어 resume 이후에도 재현 가능
 
+## Inference FLOPs 및 시간 기록
+
+학습 FLOPs는 기록하지 않는다. 대신 최종 ID/OOD inference에서 각 split별 forward
+연산량과 wall-clock inference time을 `splits.<split>.inference_compute`에 기록한다.
+
+```json
+{
+  "flops": 123456789,
+  "tflops": 0.000123,
+  "flops_per_sample": 246913.6,
+  "inference_seconds": 1.23,
+  "milliseconds_per_sample": 2.46,
+  "samples_per_second": 406.5,
+  "forward_calls": 4
+}
+```
+
+FLOPs는 실제 runtime tensor shape를 기준으로 다음 연산을 합산한다.
+
+- 모든 `nn.Linear` projection의 multiply-add (MAC 1회 = 2 FLOPs)
+- attention의 `QK^T` 및 attention-weighted-value (`AV`) matrix multiplication
+
+CoT는 KV cache를 쓰는 autoregressive generation이므로 매 decoding call의 실제
+query/key 길이를 사용한다. Embedding lookup, LayerNorm, softmax, activation,
+masking 및 elementwise residual 연산은 이 FLOPs 합계에서 제외되며, 해당 기준은
+결과 JSON의 `method` 필드에도 함께 저장된다.
+
 ## 변경된 파일
 
 - `src/original/experiment.py`: validation, 학습 루프, AMP, scheduler, checkpoint,

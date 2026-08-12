@@ -8,6 +8,7 @@ import os
 import random
 import shutil
 import time
+import types
 from collections import defaultdict
 from pathlib import Path
 from contextlib import nullcontext
@@ -33,6 +34,7 @@ from .model import (
     OriginalModel,
     OriginalModelConfig,
     RecurrentTransformer,
+    SelfAttention,
     build_model,
     count_parameters,
 )
@@ -191,6 +193,102 @@ def _autocast_context(device: torch.device, enabled: bool):
     return torch.autocast(device_type=device.type, dtype=torch.float16)
 
 
+class InferenceComputeMeter:
+    """Runtime FLOP and wall-time meter for this repository's forward passes.
+
+    Counts multiply-add work in ``nn.Linear`` modules and the two attention
+    matrix multiplications (QK^T and AV) from their runtime tensor shapes.
+    It deliberately excludes embedding lookups, normalisation, masking,
+    softmax, activations, and elementwise residual operations.
+    """
+
+    method = "runtime linear projections + attention QK^T/AV; excludes embedding, norm, softmax, activation, masking, and elementwise ops"
+
+    def __init__(self, model: OriginalModel, device: torch.device) -> None:
+        self.model = model
+        self.device = device
+        self.linear_flops = 0
+        self.attention_flops = 0
+        self.inference_seconds = 0.0
+        self.forward_calls = 0
+        self._hooks: list[Any] = []
+        self._patched_attention: list[SelfAttention] = []
+
+    def __enter__(self) -> "InferenceComputeMeter":
+        for module in self.model.modules():
+            if isinstance(module, nn.Linear):
+                self._hooks.append(module.register_forward_hook(self._linear_hook))
+            if isinstance(module, SelfAttention):
+                self._hooks.append(module.register_forward_hook(self._attention_hook))
+                self._patch_incremental_attention(module)
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        for attention in self._patched_attention:
+            delattr(attention, "incremental")
+        self._patched_attention.clear()
+
+    def _linear_hook(self, module: nn.Module, inputs: tuple[object, ...], _output: object) -> None:
+        assert isinstance(module, nn.Linear)
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, Tensor):
+            raise TypeError("linear meter expected a Tensor input")
+        vectors = input_tensor.numel() // module.in_features
+        self.linear_flops += 2 * vectors * module.in_features * module.out_features
+
+    def _attention_hook(self, _module: nn.Module, inputs: tuple[object, ...], _output: object) -> None:
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, Tensor):
+            raise TypeError("attention meter expected a Tensor input")
+        batch, length, width = input_tensor.shape
+        # QK^T and AV each cost 2 * B * L * L * d_model FLOPs.
+        self.attention_flops += 4 * batch * length * length * width
+
+    def _patch_incremental_attention(self, attention: SelfAttention) -> None:
+        original = attention.incremental
+
+        def counted_incremental(
+            _module: SelfAttention,
+            x: Tensor,
+            position_ids: Tensor,
+            cache: tuple[Tensor, Tensor] | None,
+        ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+            batch, new_length, width = x.shape
+            key_length = new_length if cache is None else new_length + cache[0].shape[-2]
+            self.attention_flops += 4 * batch * new_length * key_length * width
+            return original(x, position_ids, cache)
+
+        attention.incremental = types.MethodType(counted_incremental, attention)
+        self._patched_attention.append(attention)
+
+    def measure(self, forward: Any) -> Any:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        started = time.perf_counter()
+        result = forward()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.inference_seconds += time.perf_counter() - started
+        self.forward_calls += 1
+        return result
+
+    def summary(self, n_samples: int) -> dict[str, object]:
+        flops = self.linear_flops + self.attention_flops
+        return {
+            "flops": flops,
+            "tflops": flops / 1e12,
+            "flops_per_sample": flops / max(n_samples, 1),
+            "inference_seconds": self.inference_seconds,
+            "milliseconds_per_sample": 1e3 * self.inference_seconds / max(n_samples, 1),
+            "samples_per_second": n_samples / max(self.inference_seconds, 1e-12),
+            "forward_calls": self.forward_calls,
+            "method": self.method,
+        }
+
+
 def train_epoch(
     model: OriginalModel,
     loader: DataLoader,
@@ -330,25 +428,31 @@ def evaluate_classifier(
     halt_sum = 0
     final_kl_sum = 0.0
     final_kl_count = 0
-    for batch_cpu in loader:
-        batch = move_tensors(batch_cpu, device)
-        if adaptive_kl:
-            if not isinstance(model, RecurrentTransformer):
-                raise ValueError("KL halting is available only for the recurrent model")
-            logits, diagnostics = model.forward_adaptive(
-                batch["input_ids"], batch["attn_mask"], batch["slot_pos"]
-            )
-            step_sum += int(diagnostics["steps_taken"].sum().item())
-            halt_sum += int(diagnostics["halted"].sum().item())
-            indices = (diagnostics["steps_taken"] - 1).unsqueeze(1)
-            final_kl = diagnostics["symmetric_kl"].gather(1, indices).squeeze(1)
-            finite = torch.isfinite(final_kl)
-            final_kl_sum += float(final_kl[finite].sum().item())
-            final_kl_count += int(finite.sum().item())
-        else:
-            logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
-        _accumulate_metrics(logits.argmax(-1), batch["labels"], batch["n_swaps"], totals)
+    with InferenceComputeMeter(model, device) as meter:
+        for batch_cpu in loader:
+            batch = move_tensors(batch_cpu, device)
+            if adaptive_kl:
+                if not isinstance(model, RecurrentTransformer):
+                    raise ValueError("KL halting is available only for the recurrent model")
+                logits, diagnostics = meter.measure(
+                    lambda: model.forward_adaptive(
+                        batch["input_ids"], batch["attn_mask"], batch["slot_pos"]
+                    )
+                )
+                step_sum += int(diagnostics["steps_taken"].sum().item())
+                halt_sum += int(diagnostics["halted"].sum().item())
+                indices = (diagnostics["steps_taken"] - 1).unsqueeze(1)
+                final_kl = diagnostics["symmetric_kl"].gather(1, indices).squeeze(1)
+                finite = torch.isfinite(final_kl)
+                final_kl_sum += float(final_kl[finite].sum().item())
+                final_kl_count += int(finite.sum().item())
+            else:
+                logits = meter.measure(
+                    lambda: model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+                )
+            _accumulate_metrics(logits.argmax(-1), batch["labels"], batch["n_swaps"], totals)
     metrics = _finish_metrics(totals)
+    metrics["inference_compute"] = meter.summary(int(metrics["n_samples"]))
     if adaptive_kl:
         samples = int(metrics["n_samples"])
         metrics.update(
@@ -380,15 +484,18 @@ def evaluate_cot(
     model.eval()
     totals = _empty_totals()
     groups = group_rows_by_swap_count(_rows_from_dataset(dataset))
-    for n_swaps, rows in sorted(groups.items()):
-        for start in range(0, len(rows), generation_batch_size):
-            chunk = rows[start : start + generation_batch_size]
-            predictions = model.generate_states(chunk).cpu()
-            labels = torch.tensor([row["labels"] for row in chunk], dtype=torch.long)
-            lengths = torch.full((len(chunk),), n_swaps, dtype=torch.long)
-            _accumulate_metrics(predictions, labels, lengths, totals)
+    device = model.embedding.weight.device
+    with InferenceComputeMeter(model, device) as meter:
+        for n_swaps, rows in sorted(groups.items()):
+            for start in range(0, len(rows), generation_batch_size):
+                chunk = rows[start : start + generation_batch_size]
+                predictions = meter.measure(lambda: model.generate_states(chunk)).cpu()
+                labels = torch.tensor([row["labels"] for row in chunk], dtype=torch.long)
+                lengths = torch.full((len(chunk),), n_swaps, dtype=torch.long)
+                _accumulate_metrics(predictions, labels, lengths, totals)
     metrics = _finish_metrics(totals)
     metrics["evaluation_mode"] = "autoregressive_trace_generation"
+    metrics["inference_compute"] = meter.summary(int(metrics["n_samples"]))
     return metrics
 
 
