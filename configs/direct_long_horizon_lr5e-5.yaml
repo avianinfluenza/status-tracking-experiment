@@ -1,0 +1,42 @@
+# Long-horizon Direct Transformer run: low learning rate for stable convergence.
+architecture: direct
+position_encoding: sinusoidal
+d_model: 128
+n_heads: 4
+d_ff: 512
+dropout: 0.0
+num_layers: 6
+classifier_dim: 2
+run_name: direct-long-lr5e-5
+
+training:
+  epochs: 300
+  batch_size: 128
+  optimizer: AdamW
+  learning_rate: 0.00005
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  scheduler:
+    name: cosine
+    warmup_epochs: 10
+    min_lr: 0.000001
+  seeds: [0, 1, 2]
+
+validation:
+  ratio: 0.1
+
+checkpointing:
+  save_every: 10
+  resume: null
+  overwrite: false
+
+performance:
+  amp: true
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+
+evaluation:
+  batch_size: 128
+  splits: [id_test, ood_x4, ood_x8]
+  metrics: [slot_accuracy, exact_match, exact_match_by_swaps]
