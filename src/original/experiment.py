@@ -189,10 +189,14 @@ def train_epoch(
     random_loop_range: tuple[int, int] | None = None,
     epoch: int | None = None,
     show_progress: bool = False,
+    metrics: dict[str, float] | None = None,
 ) -> float:
     model.train()
     weighted_loss = 0.0
     target_count = 0
+    slot_correct = 0
+    exact_correct = 0
+    sample_count = 0
     progress = None
     batches: Iterable = loader
     if show_progress:
@@ -230,6 +234,7 @@ def train_epoch(
                 )
                 targets = batch["labels"]
                 final_logits = loop_logits[:, -1]
+                logits = final_logits
                 final_loss = F.cross_entropy(
                     final_logits.reshape(-1, final_logits.shape[-1]),
                     targets.reshape(-1),
@@ -270,12 +275,28 @@ def train_epoch(
             count = int((targets != -100).sum().item())
             weighted_loss += float(loss.item()) * count
             target_count += count
+            valid = targets != -100
+            predictions = logits.detach().argmax(dim=-1)
+            correct = (predictions == targets) & valid
+            slot_correct += int(correct.sum().item())
+            exact_correct += int((correct | ~valid).all(dim=1).sum().item())
+            sample_count += targets.shape[0]
             if progress is not None:
                 running_loss = weighted_loss / max(target_count, 1)
-                progress.set_postfix(loss=f"{running_loss:.4f}")
+                progress.set_postfix(
+                    loss=f"{running_loss:.4f}",
+                    slot_accuracy=f"{slot_correct / max(target_count, 1):.4f}",
+                    exact_match=f"{exact_correct / max(sample_count, 1):.4f}",
+                )
     finally:
         if progress is not None:
             progress.close()
+    if metrics is not None:
+        metrics.update(
+            loss=weighted_loss / max(target_count, 1),
+            slot_accuracy=slot_correct / max(target_count, 1),
+            exact_match=exact_correct / max(sample_count, 1),
+        )
     return weighted_loss / max(target_count, 1)
 
 
@@ -623,6 +644,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         epoch_iterable = epoch_progress
     try:
         for epoch in epoch_iterable:
+            train_metrics: dict[str, float] = {}
             loss = (
                 train_epoch(
                     model,
@@ -634,11 +656,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     random_loop_range=(random_min, random_max) if args.random_loops else None,
                     epoch=epoch,
                     show_progress=show_progress,
+                    metrics=train_metrics,
                 )
             )
             losses.append(loss)
             if epoch_progress is not None:
-                epoch_progress.set_postfix(loss=f"{loss:.4f}")
+                epoch_progress.set_postfix(
+                    loss=f"{loss:.4f}",
+                    slot_accuracy=f"{train_metrics['slot_accuracy']:.4f}",
+                    exact_match=f"{train_metrics['exact_match']:.4f}",
+                )
     finally:
         if epoch_progress is not None:
             epoch_progress.close()
