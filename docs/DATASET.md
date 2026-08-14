@@ -44,6 +44,26 @@
 스플릿에 동일한 `(init, swaps)` 조합이 들어가지 않도록 중복을 제거한다.
 OOD 스플릿은 학습 범위보다 긴 교환열을 사용한다.
 
+길이 확장 프로파일도 별도로 제공한다. 기존 `data/` 파일은 변경하지 않고
+`data/extended_length/`에 저장한다.
+
+| 파일 | 교환 횟수 | 생성 시드 |
+|---|---:|---:|
+| `data/extended_length/train.jsonl` | 2~32 | 0 |
+| `data/extended_length/id_test.jsonl` | 2~32 | 1000 |
+| `data/extended_length/ood_x4.jsonl` | 40~80 | 2004 |
+| `data/extended_length/ood_x8.jsonl` | 80~160 | 2008 |
+
+재생성 명령:
+
+```bash
+python -m src.data.data --extended-length --out data/extended_length \
+  --n-train 10000 --n-test 500 --seed 0
+```
+
+학습 시 `--extended-length`를 지정하면 기본 `data/` 대신 이 디렉터리를
+자동으로 사용한다.
+
 파일 첫 줄의 예시는 다음과 같다.
 
 ```json

@@ -47,6 +47,22 @@ python scripts/run_original_experiments.py --architecture recurrent --smoke --de
 python scripts/run_original_experiments.py --architecture recurrent-r0 --smoke --device cpu \
   --eval-loop-counts 1 2 \
   --adaptive-kl-eval --adaptive-min-confidence 0.0 --adaptive-update-threshold 1000000000
+
+# Fixed output registers at the start of the sequence (accepts True/False too)
+python scripts/run_original_experiments.py --architecture recurrent-r0 \
+  --slot_first True --num-loops 6 --seed 0 --device cuda
+
+# Extended-length profile: train/ID 2~32, OOD x4 40~80, OOD x8 80~160
+python scripts/run_original_experiments.py --architecture recurrent-r0 \
+  --extended-length --slot_first True --num-loops 6 --seed 0 --device cuda
+```
+
+The extended-length JSONL files are stored under `data/extended_length/`. To
+regenerate them deterministically:
+
+```bash
+python -m src.data.data --extended-length --out data/extended_length \
+  --n-train 10000 --n-test 500 --seed 0
 ```
 
 YAML config 진입점:

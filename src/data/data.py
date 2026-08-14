@@ -26,6 +26,7 @@ class GenConfig:
     max_swaps: int = 10      # 학습이면 L_train
     noop_ratio: float = 0.0  # 자기 자신이랑 교환하는 문장 비율. 상태는 안 바뀜 (노이즈용)
     seed: int = 0
+    profile: str = "default"
 
     def __post_init__(self):
         assert 2 <= self.n_entities <= N_ENTITIES
@@ -143,25 +144,39 @@ def main():
     p.add_argument("--ood-mult", type=int, nargs="+", default=[4, 8])
     p.add_argument("--noop-ratio", type=float, default=0.0)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--extended-length",
+        action="store_true",
+        help="generate the 2~32 train/ID, 40~80 OOD-x4, and 80~160 OOD-x8 profile",
+    )
     a = p.parse_args()
 
     out = Path(a.out)
     base = dict(n_entities=a.n_entities, noop_ratio=a.noop_ratio)
+    if a.extended_length:
+        l_train = 32
+        profile = "extended_length_v1"
+        ood_ranges = {4: (40, 80), 8: (80, 160)}
+    else:
+        l_train = a.l_train
+        profile = "default"
+        ood_ranges = {
+            m: (l_train * (m // 2 or 1), l_train * m) for m in a.ood_mult
+        }
 
     # train과 id_test는 조건이 같고 시드만 다르다.
     # seen을 공유해서 두 스플릿에 같은 문제가 들어가는 걸 막는다
     seen = set()
-    print(f"[train / id_test]  swaps 2~{a.l_train}")
-    cfg = GenConfig(min_swaps=2, max_swaps=a.l_train, seed=a.seed, **base)
+    print(f"[train / id_test]  swaps 2~{l_train}")
+    cfg = GenConfig(min_swaps=2, max_swaps=l_train, seed=a.seed, profile=profile, **base)
     write_jsonl(out / "train.jsonl", make_split(a.n_train, cfg, seen), cfg)
 
-    cfg = GenConfig(min_swaps=2, max_swaps=a.l_train, seed=a.seed + 1000, **base)
+    cfg = GenConfig(min_swaps=2, max_swaps=l_train, seed=a.seed + 1000, profile=profile, **base)
     write_jsonl(out / "id_test.jsonl", make_split(a.n_test, cfg, seen), cfg)
 
     # ood는 학습보다 훨씬 긴 교환. 길이 일반화 시험용
-    for m in a.ood_mult:
-        lo, hi = a.l_train * (m // 2 or 1), a.l_train * m
-        cfg = GenConfig(min_swaps=lo, max_swaps=hi, seed=a.seed + 2000 + m, **base)
+    for m, (lo, hi) in ood_ranges.items():
+        cfg = GenConfig(min_swaps=lo, max_swaps=hi, seed=a.seed + 2000 + m, profile=profile, **base)
         print(f"[ood x{m}]  swaps {lo}~{hi}")
         write_jsonl(out / f"ood_x{m}.jsonl", make_split(a.n_test, cfg), cfg)
 
