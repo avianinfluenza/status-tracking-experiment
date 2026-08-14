@@ -9,6 +9,7 @@ import re
 import time
 from collections import defaultdict
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -74,13 +75,16 @@ def make_loader(
     shuffle: bool,
     seed: int,
     max_samples: int | None,
+    slot_first: bool = False,
 ) -> DataLoader:
     if architecture == "cot":
+        if slot_first:
+            raise ValueError("--slot-first is supported for direct/recurrent classifiers, not cot")
         dataset: Dataset = ExplicitCoTDataset(str(path))
         collator = collate_cot
     else:
         dataset = BallSwapDataset(path)
-        collator = collate_fn
+        collator = partial(collate_fn, slot_first=slot_first)
     return DataLoader(
         _subset(dataset, max_samples),
         batch_size=batch_size,
@@ -161,6 +165,8 @@ def build_run_name(args: argparse.Namespace) -> str:
     if args.run_name:
         return args.run_name
     name_parts = [args.architecture, args.position_encoding, f"seed{args.seed}"]
+    if args.extended_length:
+        name_parts.append("extended-length")
     if args.deep_supervision_weight > 0.0:
         name_parts.append(f"ds{args.deep_supervision_weight:g}")
     if args.noop_eval_ratio > 0.0:
@@ -480,6 +486,14 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    def parse_bool(value: str) -> bool:
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "y", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "n", "off"}:
+            return False
+        raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--architecture",
@@ -529,10 +543,27 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data")
+    parser.add_argument(
+        "--extended-length",
+        "--extended_length",
+        dest="extended_length",
+        action="store_true",
+        help="use data/extended_length (train/ID 2~32, OOD x4 40~80, OOD x8 80~160)",
+    )
     parser.add_argument("--output-dir", type=Path, default=ROOT / "runs" / "original")
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-eval-samples", type=int, default=None)
+    parser.add_argument(
+        "--slot-first",
+        "--slot_first",
+        dest="slot_first",
+        nargs="?",
+        const=True,
+        default=False,
+        type=parse_bool,
+        help="place fixed output SLOT registers before the body (accepts optional True/False)",
+    )
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args(argv)
@@ -582,8 +613,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.eval_batch_size = 4
         args.max_train_samples = 16
         args.max_eval_samples = 4
+    if args.slot_first and args.architecture == "cot":
+        raise ValueError("--slot-first is supported for direct/recurrent classifiers, not cot")
 
     seed_everything(args.seed)
+    if args.extended_length and args.data_dir == ROOT / "data":
+        args.data_dir = ROOT / "data" / "extended_length"
+    required_splits = [args.data_dir / f"{split}.jsonl" for split in ("train", *EVAL_SPLITS)]
+    missing_splits = [str(path) for path in required_splits if not path.is_file()]
+    if missing_splits:
+        raise FileNotFoundError(
+            "missing dataset split(s): " + ", ".join(missing_splits)
+            + ". Generate them with `python -m src.data.data --extended-length --out data/extended_length`."
+        )
     device = resolve_device(args.device)
     config = OriginalModelConfig(
         architecture=args.architecture,
@@ -626,6 +668,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         shuffle=True,
         seed=args.seed,
         max_samples=args.max_train_samples,
+        slot_first=args.slot_first,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     started = time.perf_counter()
@@ -685,6 +728,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 shuffle=False,
                 seed=args.seed,
                 max_samples=args.max_eval_samples,
+                slot_first=args.slot_first,
             )
             metrics = evaluate_classifier(
                 model,
@@ -727,7 +771,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 RowsDataset(noisy_rows),
                 batch_size=args.eval_batch_size,
                 shuffle=False,
-                collate_fn=collate_fn,
+                collate_fn=partial(collate_fn, slot_first=args.slot_first),
             )
             split_metrics[split_name] = evaluate_classifier(
                 model,
@@ -773,6 +817,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "eval_loop_counts": args.eval_loop_counts,
             "adaptive_update_threshold": args.adaptive_update_threshold,
             "adaptive_min_confidence": args.adaptive_min_confidence,
+            "slot_first": args.slot_first,
+            "extended_length": args.extended_length,
         },
         "paths": {
             "config": str(config_path),

@@ -80,6 +80,10 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
         arguments.append("--adaptive-kl-eval")
     if config.get("progress") is False:
         arguments.append("--no-progress")
+    if config.get("slot_first", (config.get("model") or {}).get("slot_first", False)):
+        arguments.append("--slot-first")
+    if config.get("extended_length", False):
+        arguments.append("--extended-length")
     if config.get("smoke"):
         arguments.append("--smoke")
     return arguments

@@ -3,11 +3,12 @@
 # 파일에는 원본(init, swaps, labels)만 있으니까 토큰화/패딩/SLOT 부착을
 # 여기서 배치 단위로 한다. 패딩은 배치 내 최장 샘플 기준.
 #
-# 시퀀스 구성: 초기배정 -> 교환 -> [PAD]... -> [SLOT] 5개
-# SLOT을 맨 끝에 두면 위치가 배치 안에서 다 같아져서 gather 한 번이면 된다.
-# 대신 PAD가 중간에 끼니까 attn_mask 꼭 모델에 넘길 것.
+# 기본 시퀀스 구성: 초기배정 -> 교환 -> [PAD]... -> [SLOT] 5개
+# slot_first 시퀀스 구성: [SLOT] 5개 -> 초기배정 -> 교환 -> [PAD]...
+# 두 형식 모두 attn_mask로 PAD를 attention에서 제외한다.
 
 import json
+from functools import partial
 from pathlib import Path
 
 import torch
@@ -48,18 +49,23 @@ class BallSwapDataset(Dataset):
         return self.rows[i]
 
 
-def collate_fn(batch):
+def collate_fn(batch, *, slot_first=False):
     bodies = [encode_body(r["init"], r["swaps"]) for r in batch]
     max_body = max(len(b) for b in bodies)
 
     input_ids, attn_mask = [], []
     for body in bodies:
         n_pad = max_body - len(body)
-        input_ids.append(body + [PAD_ID] * n_pad + SLOT_IDS)
-        attn_mask.append([1] * len(body) + [0] * n_pad + [1] * N_SLOTS)
+        if slot_first:
+            # Keep output registers at logical positions 0..N_SLOTS-1.
+            input_ids.append(SLOT_IDS + body + [PAD_ID] * n_pad)
+            attn_mask.append([1] * N_SLOTS + [1] * len(body) + [0] * n_pad)
+        else:
+            input_ids.append(body + [PAD_ID] * n_pad + SLOT_IDS)
+            attn_mask.append([1] * len(body) + [0] * n_pad + [1] * N_SLOTS)
 
-    # SLOT은 항상 마지막 5칸이라 배치 안에서 위치가 다 같다
-    slot_pos = list(range(max_body, max_body + N_SLOTS))
+    # SLOT registers are fixed at the beginning only in slot_first mode.
+    slot_pos = list(range(N_SLOTS)) if slot_first else list(range(max_body, max_body + N_SLOTS))
 
     labels = []
     for r in batch:
@@ -77,10 +83,10 @@ def collate_fn(batch):
     }
 
 
-def make_loader(path, batch_size=256, shuffle=False, num_workers=0):
+def make_loader(path, batch_size=256, shuffle=False, num_workers=0, slot_first=False):
     return DataLoader(BallSwapDataset(path), batch_size=batch_size,
                       shuffle=shuffle, num_workers=num_workers,
-                      collate_fn=collate_fn)
+                      collate_fn=partial(collate_fn, slot_first=slot_first))
 
 
 if __name__ == "__main__":

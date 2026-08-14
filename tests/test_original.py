@@ -65,6 +65,17 @@ def test_symbolic_trace_matches_all_five_final_labels() -> None:
     assert trace[-1] == row["labels"]
 
 
+def test_slot_first_collation_uses_fixed_register_positions() -> None:
+    short = sample_row()
+    long = {**sample_row(), "swaps": sample_row()["swaps"] + [[0, 2], [2, 4]]}
+    batch = collate_fn([short, long], slot_first=True)
+    assert batch["slot_pos"].tolist() == [[0, 1, 2, 3, 4]] * 2
+    assert batch["input_ids"][:, :5].tolist() == [batch["input_ids"][0, :5].tolist()] * 2
+    assert batch["attn_mask"][:, :5].tolist() == [[1, 1, 1, 1, 1]] * 2
+    assert batch["attn_mask"][0, -1].item() == 0
+    assert batch["attn_mask"][1, -1].item() == 1
+
+
 @pytest.mark.parametrize("position_encoding", ["sinusoidal", "rope"])
 def test_direct_supports_both_position_encodings(position_encoding: str) -> None:
     batch = collate_fn([sample_row(), sample_row()])
@@ -280,6 +291,16 @@ def test_team_yaml_config_maps_to_canonical_trainer_cli() -> None:
     assert "--position-encoding" in arguments
     assert "rope" in arguments
     assert "--adaptive-kl-eval" in arguments
+
+
+def test_slot_first_cli_accepts_snake_case_boolean_value() -> None:
+    arguments = parse_args(["--architecture", "direct", "--slot_first", "True"])
+    assert arguments.slot_first is True
+
+
+def test_slot_first_yaml_config_maps_to_cli() -> None:
+    arguments = config_to_argv({"architecture": "direct", "slot_first": True})
+    assert "--slot-first" in arguments
 
 
 def test_r0_yaml_config_maps_advanced_ball_swap_options() -> None:

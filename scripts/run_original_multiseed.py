@@ -18,6 +18,15 @@ from src.original.experiment import parse_args as parse_run_args
 from src.original.experiment import run, write_json
 
 
+def parse_bool(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2])
@@ -35,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-loop-counts", type=int, nargs="+", default=None)
     parser.add_argument("--deep-supervision-weight", type=float, default=0.0)
     parser.add_argument("--noop-eval-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--slot-first", "--slot_first", dest="slot_first", nargs="?", const=True,
+        default=False, type=parse_bool,
+    )
+    parser.add_argument("--extended-length", "--extended_length", dest="extended_length", action="store_true")
     parser.add_argument("--loop-conditioning", choices=("none", "learned"), default="none")
     parser.add_argument("--residual-scale", type=float, default=1.0)
     parser.add_argument("--recurrent-blocks", type=int, default=1)
@@ -70,6 +84,10 @@ def main() -> None:
                 "--output-dir", str(suite_dir),
                 "--noop-eval-ratio", str(args.noop_eval_ratio),
             ]
+            if args.slot_first:
+                run_argv.append("--slot-first")
+            if args.extended_length:
+                run_argv.append("--extended-length")
             if args.no_progress:
                 run_argv.append("--no-progress")
             if architecture in ("recurrent", "recurrent-r0"):
@@ -112,6 +130,8 @@ def main() -> None:
         "seeds": sorted(set(args.seeds)),
         "position_encoding": args.position_encoding,
         "smoke": args.smoke,
+        "slot_first": args.slot_first,
+        "extended_length": args.extended_length,
         "runs": [
             {
                 "run_name": result["run_name"],
