@@ -14,3 +14,4 @@ wandb/
 lightning_logs/
 .ipynb_checkpoints/
 .DS_Store
+__training__.md
