@@ -1297,6 +1297,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             + ". Generate them with `python -m src.data.data --extended-length --out data/extended_length`."
         )
     device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
     config = OriginalModelConfig(
         architecture=args.architecture,
         position_encoding=args.position_encoding,

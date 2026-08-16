@@ -146,8 +146,17 @@ class SinusoidalPositionEncoding(nn.Module):
         table[:, 1::2] = angles[:, : table[:, 1::2].shape[1]].cos()
         self.cache = table
 
-    def forward(self, position_ids: Tensor, dtype: torch.dtype) -> Tensor:
-        self._ensure(int(position_ids.max().item()) + 1, position_ids.device)
+    def forward(
+        self,
+        position_ids: Tensor,
+        dtype: torch.dtype,
+        *,
+        cache_length: int | None = None,
+    ) -> Tensor:
+        # The caller knows the required cache length, including incremental
+        # decoding offsets. Avoid extracting a CUDA scalar with .item().
+        length = position_ids.shape[-1] if cache_length is None else cache_length
+        self._ensure(length, position_ids.device)
         return self.cache[position_ids].to(dtype=dtype)
 
 
@@ -927,7 +936,11 @@ class ExplicitCoTTransformer(TokenBackbone):
         ).expand(batch, -1)
         h = self.embedding(input_ids) * math.sqrt(self.config.d_model)
         if self.config.position_encoding == "sinusoidal":
-            h = h + self.sinusoidal(positions, h.dtype)
+            h = h + self.sinusoidal(
+                positions,
+                h.dtype,
+                cache_length=start_position + length,
+            )
         h = self.embedding_dropout(h)
         new_caches: list[tuple[Tensor, Tensor]] = []
         for layer, cache in zip(self.layers, caches, strict=True):
