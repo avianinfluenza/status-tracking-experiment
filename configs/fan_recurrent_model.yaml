@@ -1,0 +1,34 @@
+# Fan et al.-aligned Looped Transformer condition.
+architecture: fan-recurrent
+position_encoding: none
+d_model: 128
+n_heads: 4
+d_ff: 512
+dropout: 0.0
+num_layers: 1
+num_loops: 10
+classifier_dim: 2
+
+training:
+  online_training: true
+  train_steps: 100000
+  batch_size: 128
+  optimizer: AdamW
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  swaps_per_loop: 1.0
+  curriculum_min_swaps: 2
+  curriculum_max_swaps: 10
+  curriculum_steps_per_length: 1000
+  seeds: [0, 1, 2, 3, 4]
+
+ablations:
+  # Retained for compatibility and controlled comparison; main condition is 0.
+  deep_supervision_weight: 0.0
+
+evaluation:
+  splits: [id_test, ood_x4, ood_x8, boundary_11_20]
+  metrics: [slot_accuracy, exact_match, exact_match_by_swaps]
+  length_matched_eval: true
+  trajectory_probe_eval: false

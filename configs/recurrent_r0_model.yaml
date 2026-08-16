@@ -22,6 +22,7 @@ adaptive_halting:
   min_confidence: 0.7
   min_loops: 2
   patience: 2
+  max_loops: null
 
 ablations:
   deep_supervision_weight: 0.0
@@ -36,8 +37,11 @@ training:
   gradient_clip: 1.0
   seeds: [0, 1, 2]
   random_loops: false
+  swaps_per_loop: null
 
 evaluation:
   splits: [id_test, ood_x4, ood_x8]
   metrics: [slot_accuracy, exact_match, exact_match_by_swaps]
   loop_counts: [1, 2, 4, 6, 8, 12, 16, 24]
+  trajectory_probe_eval: false
+  length_matched_eval: false

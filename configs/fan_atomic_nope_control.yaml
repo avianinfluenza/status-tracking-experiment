@@ -1,0 +1,27 @@
+# Diagnostic control: one token per initial assignment and per swap, while
+# retaining Fan-style NoPE, causal recurrence, and final-state-only CE.
+architecture: fan-recurrent
+position_encoding: none
+fan_input_format: atomic
+fan_positional_control: false
+d_model: 128
+n_heads: 4
+d_ff: 512
+dropout: 0.0
+num_layers: 1
+num_loops: 10
+
+training:
+  online_training: true
+  train_steps: 100000
+  batch_size: 128
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  gradient_clip: 1.0
+  swaps_per_loop: 1.0
+  curriculum_min_swaps: 2
+  curriculum_max_swaps: 10
+  curriculum_steps_per_length: 1000
+
+ablations:
+  deep_supervision_weight: 0.0
