@@ -46,19 +46,23 @@ def sample_problem(rng, cfg):
 
     n_swaps = rng.randint(cfg.min_swaps, cfg.max_swaps)
     swaps = []
+    intermediate_states = []
     for _ in range(n_swaps):
         if rng.random() < cfg.noop_ratio:
             a = rng.randrange(k)
             swaps.append((a, a))  # noop. 문장은 나가지만 상태 그대로
-            continue
-        a, b = rng.sample(range(k), 2)
-        swaps.append((a, b))
-        state[a], state[b] = state[b], state[a]
+        else:
+            a, b = rng.sample(range(k), 2)
+            swaps.append((a, b))
+            state[a], state[b] = state[b], state[a]
+        # This is a label only.  It is never rendered into the input text.
+        intermediate_states.append(list(state))
 
     return {
         "init_state": init_state,
         "swaps": swaps,
         "final_state": state,
+        "intermediate_states": intermediate_states,
         "n_swaps": n_swaps,
     }
 
@@ -92,6 +96,7 @@ def to_row(problem, cfg):
         "init": problem["init_state"],
         "swaps": [list(p) for p in problem["swaps"]],
         "labels": problem["final_state"],
+        "intermediate_states": problem["intermediate_states"],
         "n_swaps": problem["n_swaps"],
     }
 
@@ -115,6 +120,26 @@ def make_split(n, cfg, seen=None):
         seen.add(key)
         out.append(to_row(pr, cfg))
     return out
+
+
+def make_balanced_length_sweep(samples_per_length, cfg):
+    """Generate an equal number of deterministic examples at every swap length."""
+    if samples_per_length < 1:
+        raise ValueError("samples_per_length must be positive")
+    rows = []
+    seen = set()
+    for n_swaps in range(cfg.min_swaps, cfg.max_swaps + 1):
+        length_cfg = GenConfig(
+            n_entities=cfg.n_entities,
+            min_swaps=n_swaps,
+            max_swaps=n_swaps,
+            noop_ratio=cfg.noop_ratio,
+            seed=cfg.seed + 1100 + n_swaps,
+            profile=cfg.profile,
+        )
+        rows.extend(make_split(samples_per_length, length_cfg, seen))
+    random.Random(cfg.seed).shuffle(rows)
+    return rows
 
 
 def write_jsonl(path, rows, cfg):
@@ -149,10 +174,34 @@ def main():
         action="store_true",
         help="generate the 2~32 train/ID, 40~80 OOD-x4, and 80~160 OOD-x8 profile",
     )
+    p.add_argument(
+        "--boundary-sweep",
+        action="store_true",
+        help="generate only a balanced boundary evaluation split",
+    )
+    p.add_argument("--boundary-min-swaps", type=int, default=11)
+    p.add_argument("--boundary-max-swaps", type=int, default=19)
+    p.add_argument("--samples-per-length", type=int, default=100)
     a = p.parse_args()
 
     out = Path(a.out)
     base = dict(n_entities=a.n_entities, noop_ratio=a.noop_ratio)
+    if a.boundary_sweep:
+        cfg = GenConfig(
+            min_swaps=a.boundary_min_swaps,
+            max_swaps=a.boundary_max_swaps,
+            seed=a.seed,
+            profile="boundary_sweep_v1",
+            **base,
+        )
+        rows = make_balanced_length_sweep(a.samples_per_length, cfg)
+        name = f"boundary_{cfg.min_swaps}_{cfg.max_swaps}.jsonl"
+        print(
+            f"[boundary sweep] swaps {cfg.min_swaps}~{cfg.max_swaps}, "
+            f"{a.samples_per_length} samples/length"
+        )
+        write_jsonl(out / name, rows, cfg)
+        return
     if a.extended_length:
         l_train = 32
         profile = "extended_length_v1"

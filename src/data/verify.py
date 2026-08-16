@@ -26,6 +26,7 @@ def parse_and_simulate(ids, mask):
     # 토큰 시퀀스만 보고 상태를 복원. 생성기 내부 로직과는 완전히 독립적인 경로
     toks = [ID2TOK[int(i)] for i in ids]
     state = {}
+    trace = []
     swap_started = False
     i = 0
     while i < len(toks):
@@ -49,8 +50,9 @@ def parse_and_simulate(ids, mask):
             swap_started = True
             a, b = toks[i], toks[i + 2]
             state[a], state[b] = state[b], state[a]
+            trace.append(dict(state))
             i += 7
-    return state
+    return state, trace
 
 
 def check_batch(cfg, seed, n=64):
@@ -73,7 +75,7 @@ def check_batch(cfg, seed, n=64):
             assert ids[pos] == SLOT_IDS[j]
 
         # 독립 재시뮬레이션 결과와 labels 대조
-        final = parse_and_simulate(ids, mask)
+        final, trace = parse_and_simulate(ids, mask)
         for j in range(len(SLOTS)):
             if j < cfg.n_entities:
                 want = COLORS.index(final[NAMES[j]])
@@ -82,6 +84,11 @@ def check_batch(cfg, seed, n=64):
             assert labels[j] == want, (
                 f"sample {i} slot {j}: labels={labels[j]} 재계산={want}\n"
                 + decode(ids, strip_pad=True))
+
+        assert len(row["intermediate_states"]) == len(trace)
+        for step, (stored, replayed) in enumerate(zip(row["intermediate_states"], trace, strict=True)):
+            expected = [COLORS.index(replayed[NAMES[j]]) for j in range(cfg.n_entities)]
+            assert stored == expected, f"sample {i} swap {step}: stored trajectory mismatch"
 
         # text 필드가 구조 데이터랑 맞는 순서로 나오는지
         pos = -1

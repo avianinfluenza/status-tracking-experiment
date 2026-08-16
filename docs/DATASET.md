@@ -64,6 +64,19 @@ python -m src.data.data --extended-length --out data/extended_length \
 학습 시 `--extended-length`를 지정하면 기본 `data/` 대신 이 디렉터리를
 자동으로 사용한다.
 
+학습 경계 직후의 붕괴 지점을 측정하기 위한 균형 split은 별도로 생성한다.
+각 swap 길이에 동일한 수의 샘플이 들어가며 학습에는 사용하지 않는다.
+
+```bash
+python -m src.data.data --boundary-sweep --out data/boundary_sweep \
+  --boundary-min-swaps 11 --boundary-max-swaps 19 \
+  --samples-per-length 100 --seed 0
+```
+
+이 명령은 `data/boundary_sweep/boundary_11_19.jsonl`에 총 900개 샘플을
+생성한다. 프로파일 이름은 `boundary_sweep_v1`이고, 길이별 생성 seed는
+`seed + 1100 + n_swaps`다.
+
 파일 첫 줄의 예시는 다음과 같다.
 
 ```json
@@ -79,6 +92,7 @@ python -m src.data.data --extended-length --out data/extended_length \
   "text": "윤성은 노란색 공을 가지고 있다. ...",
   "init": [2, 1, 0, 4, 3],
   "swaps": [[2, 3], [1, 4]],
+  "intermediate_states": [[2, 1, 4, 0, 3], [2, 3, 4, 0, 1]],
   "labels": [0, 3, 4, 1, 2],
   "n_swaps": 2
 }
@@ -86,12 +100,17 @@ python -m src.data.data --extended-length --out data/extended_length \
 
 - `init[i]`: 인물 `i`가 처음 가진 색의 인덱스
 - `swaps`: 교환할 인물 쌍의 목록. 저장 시 튜플이 아니라 `[a, b]` 배열이다.
+- `intermediate_states[t][i]`: `t + 1`번째 교환 직후 인물 `i`가 가진 색의
+  인덱스다. evaluation-only trajectory probe의 gold label이며 입력 토큰에는
+  포함되지 않는다. Fan-aligned online training batch에서는 이 필드를 제거한다.
 - `labels[i]`: 모든 교환 후 인물 `i`가 가진 색의 인덱스
 - `n_swaps`: 교환 사건 수. 길이별 평가·분석에 사용한다.
 - `text`: 사람이 읽기 위한 자연어 표현. 학습 입력은 이 문자열을 직접 토큰화하지 않고 `init`과 `swaps`에서 재구성한다.
 
 생성기의 `n_entities`를 5보다 작게 설정할 수도 있다. 이 경우 `init`, `labels`,
 `text`에는 실제 인물 수만 들어가고, 배치 라벨의 남는 슬롯은 `-100`이 된다.
+`intermediate_states`도 같은 실제 인물 수만 저장하며 collate 단계에서 남는 슬롯과
+시간축을 `-100`으로 마스킹한다.
 
 ## 토큰화와 배치 구성
 
@@ -127,6 +146,15 @@ python -m src.data.data --extended-length --out data/extended_length \
 | `slot_pos` | `[B, 5]` | 5개 슬롯 토큰의 위치 |
 | `labels` | `[B, 5]` | 색 ID. 사용하지 않는 슬롯은 -100 |
 | `n_swaps` | `[B]` | 교환 횟수. 길이별 exact match 집계에 사용 |
+| `initial_colors` | `[B, 5]` | event-wise register 초기화를 위한 색 ID |
+| `register_mask` | `[B, 5]` | 실제 인물 register 표시 |
+| `event_input_ids` | `[B, T, 7]` | step별 현재 swap 문장. 시간축만 PAD |
+| `event_mask` | `[B, T]` | 실제 swap event 표시 |
+
+`event-recurrent` 모델은 `input_ids` 전체 sequence를 사용하지 않는다. 초기
+배정으로 별도 latent register를 초기화한 뒤 `event_input_ids[:, t]`만 shared
+update에 제공한다. 7토큰 내부 순서는 매 step 다시 시작하는 local embedding으로
+표현하며 global event position은 사용하지 않는다.
 
 ## 로더 사용
 
@@ -184,6 +212,10 @@ python -m src.data.data --out data --n-train 10000 --n-test 500
 | `--ood-mult` | `4 8` | OOD 배수 목록 |
 | `--noop-ratio` | 0.0 | 자기 자신과의 교환 비율. 상태는 바뀌지 않음 |
 | `--seed` | 0 | 기본 생성 시드 |
+| `--boundary-sweep` | false | train/OOD 대신 boundary split 하나만 생성 |
+| `--boundary-min-swaps` | 11 | boundary swap 횟수 하한 |
+| `--boundary-max-swaps` | 19 | boundary swap 횟수 상한 |
+| `--samples-per-length` | 100 | 각 boundary 길이의 샘플 수 |
 
 예를 들어 학습 범위를 20회까지 늘리고 OOD 배수 4, 8, 16을 추가하려면 다음과
 같이 실행한다.
