@@ -19,8 +19,22 @@ WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 BOUNDARY_DATA_DIR="${BOUNDARY_DATA_DIR:-data/boundary_sweep}"
 OUTPUT_DIR="${OUTPUT_DIR:-runs/original}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 
 read -r -a FIXED_LOOP_COUNTS <<< "${FIXED_LOOP_COUNTS:-20 24 40 64 128}"
+
+if [[ -z "${PYTHON_BIN}" ]]; then
+  if [[ -x /venv/main/bin/python ]]; then
+    PYTHON_BIN="/venv/main/bin/python"
+  elif command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  elif command -v python3 >/dev/null 2>&1; then
+    PYTHON_BIN="python3"
+  else
+    echo "python executable not found. Set PYTHON_BIN=/path/to/python and rerun." >&2
+    exit 1
+  fi
+fi
 
 if [[ ! -f "${BOUNDARY_DATA_DIR}/boundary_11_19.jsonl" ]]; then
   echo "missing ${BOUNDARY_DATA_DIR}/boundary_11_19.jsonl"
@@ -42,7 +56,7 @@ latest_run_dir() {
 eval_fan_run() {
   local run_dir="$1"
 
-  python scripts/evaluate_length_matched_checkpoint.py \
+  "${PYTHON_BIN}" scripts/evaluate_length_matched_checkpoint.py \
     --checkpoint "${run_dir}/checkpoint.pt" \
     --swaps-per-loop 1 \
     --splits id_test ood_x4 ood_x8 \
@@ -51,7 +65,7 @@ eval_fan_run() {
     --device "${DEVICE}" \
     --out "${run_dir}/length_matched_k_sweep.json"
 
-  python scripts/evaluate_length_matched_checkpoint.py \
+  "${PYTHON_BIN}" scripts/evaluate_length_matched_checkpoint.py \
     --checkpoint "${run_dir}/checkpoint.pt" \
     --data-dir "${BOUNDARY_DATA_DIR}" \
     --splits boundary_11_19 \
@@ -70,7 +84,7 @@ run_fan() {
   local num_layers="$5"
   local run_name="$6"
 
-  python scripts/run_original_experiments.py \
+  "${PYTHON_BIN}" scripts/run_original_experiments.py \
     --architecture fan-recurrent \
     --position-encoding none \
     --fan-input-format atomic \
@@ -105,7 +119,7 @@ run_basic() {
   local num_layers="$2"
   local run_name="basic-atomic-nope-causal-l${num_layers}-seed${seed}"
 
-  python scripts/run_original_experiments.py \
+  "${PYTHON_BIN}" scripts/run_original_experiments.py \
     --architecture direct \
     --position-encoding none \
     --direct-input-format atomic \
@@ -131,7 +145,7 @@ run_basic() {
 
   local run_dir
   run_dir="$(latest_run_dir "${run_name}")"
-  python scripts/evaluate_direct_checkpoint.py \
+  "${PYTHON_BIN}" scripts/evaluate_direct_checkpoint.py \
     --checkpoint "${run_dir}/checkpoint.pt" \
     --data-dir "${BOUNDARY_DATA_DIR}" \
     --splits boundary_11_19 \
