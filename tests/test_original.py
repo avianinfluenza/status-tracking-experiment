@@ -27,6 +27,7 @@ from src.original.experiment import (
     build_run_name,
     fan_learning_rate_multiplier,
     length_proportional_loop_counts,
+    maybe_compile_model,
     parse_args,
     noop_event_input_ids,
     proportional_target_indices,
@@ -123,6 +124,23 @@ def test_fan_lr_is_constant_through_curriculum_then_cosine_decays() -> None:
     assert fan_learning_rate_multiplier(8, train_steps=100, curriculum_steps=8) == 1.0
     assert fan_learning_rate_multiplier(54, train_steps=100, curriculum_steps=8) == pytest.approx(0.5)
     assert fan_learning_rate_multiplier(100, train_steps=100, curriculum_steps=8) == pytest.approx(0.0)
+
+
+def test_cuda_compile_preserves_model_type_and_is_disabled_elsewhere(monkeypatch: pytest.MonkeyPatch) -> None:
+    model = DirectTransformer(tiny_config("direct"))
+    original_forward = model.forward
+    calls: list[object] = []
+
+    def fake_compile(function):
+        calls.append(function)
+        return function
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    assert maybe_compile_model(model, torch.device("cpu")) is model
+    assert calls == []
+    assert maybe_compile_model(model, torch.device("cuda")) is model
+    assert isinstance(model, DirectTransformer)
+    assert calls == [original_forward]
 
 
 def tiny_config(architecture: str, position_encoding: str = "sinusoidal") -> OriginalModelConfig:

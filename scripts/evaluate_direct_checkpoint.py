@@ -14,7 +14,13 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.original.experiment import EVAL_SPLITS, evaluate_classifier, make_loader, resolve_device
+from src.original.experiment import (
+    EVAL_SPLITS,
+    evaluate_classifier,
+    make_loader,
+    maybe_compile_model,
+    resolve_device,
+)
 from src.original.model import DirectTransformer, OriginalModelConfig, build_model
 
 
@@ -45,7 +51,7 @@ def main() -> None:
         raise SystemExit("this evaluator requires a direct Transformer checkpoint")
     model.load_state_dict(model_state, strict=True)
     device = resolve_device(args.device)
-    model.to(device)
+    maybe_compile_model(model.to(device), device)
 
     splits: dict[str, object] = {}
     for split in args.splits:

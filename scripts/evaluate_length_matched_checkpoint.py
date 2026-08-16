@@ -19,6 +19,7 @@ from src.original.experiment import (
     evaluate_classifier,
     evaluate_length_matched_classifier,
     make_loader,
+    maybe_compile_model,
     resolve_device,
 )
 from src.original.model import (
@@ -84,7 +85,7 @@ def main() -> None:
         raise SystemExit("length-matched evaluation requires a recurrent checkpoint")
     model.load_state_dict(model_state, strict=True)
     device = resolve_device(args.device)
-    model.to(device)
+    maybe_compile_model(model.to(device), device)
 
     run_args_path = args.checkpoint.parent / "args.json"
     saved_run_args = {}

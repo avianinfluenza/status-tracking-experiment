@@ -66,6 +66,17 @@ def resolve_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
+def maybe_compile_model(model: nn.Module, device: torch.device) -> nn.Module:
+    """Compile the model forward path on CUDA while preserving its concrete type."""
+
+    if device.type != "cuda":
+        return model
+    if not hasattr(torch, "compile"):
+        raise RuntimeError("CUDA execution requires a PyTorch build with torch.compile")
+    model.forward = torch.compile(model.forward)  # type: ignore[method-assign]
+    return model
+
+
 def _subset(dataset: Dataset, maximum: int | None) -> Dataset:
     if maximum is None:
         return dataset
@@ -1323,7 +1334,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     write_json(config_path, config.to_dict())
     write_json(args_path, vars(args))
 
-    model = build_model(config).to(device)
+    model = maybe_compile_model(build_model(config).to(device), device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     started = time.perf_counter()
     losses: list[float] = []

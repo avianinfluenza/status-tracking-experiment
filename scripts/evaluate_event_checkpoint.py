@@ -19,6 +19,7 @@ from src.original.experiment import (
     evaluate_classifier,
     evaluate_event_trajectory_probe,
     make_loader,
+    maybe_compile_model,
     resolve_device,
 )
 from src.original.model import EventWiseRecurrentTransformer, OriginalModelConfig, build_model
@@ -56,7 +57,7 @@ def main() -> None:
         raise SystemExit("this evaluator requires an event-recurrent checkpoint")
     model.load_state_dict(model_state, strict=True)
     device = resolve_device(args.device)
-    model.to(device)
+    maybe_compile_model(model.to(device), device)
 
     splits: dict[str, object] = {}
     for split in args.splits:
