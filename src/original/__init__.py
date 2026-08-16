@@ -2,7 +2,9 @@
 
 from .model import (
     DirectTransformer,
+    EventWiseRecurrentTransformer,
     ExplicitCoTTransformer,
+    FanRecurrentTransformer,
     OriginalModelConfig,
     RecurrentTransformer,
     build_model,
@@ -10,7 +12,9 @@ from .model import (
 
 __all__ = [
     "DirectTransformer",
+    "EventWiseRecurrentTransformer",
     "ExplicitCoTTransformer",
+    "FanRecurrentTransformer",
     "OriginalModelConfig",
     "RecurrentTransformer",
     "build_model",

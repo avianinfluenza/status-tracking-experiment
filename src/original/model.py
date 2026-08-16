@@ -9,6 +9,8 @@ from typing import Literal, Sequence
 import torch
 from torch import Tensor, nn
 
+from ..data.atomic import ATOMIC_PAD_ID, ATOMIC_VOCAB_SIZE
+from ..data.collate import EVENT_WIDTH
 from ..data.vocab import N_ENTITIES, N_LABELS, PAD_ID, VOCAB_SIZE
 from ..model.classifier import Classifier
 from .data import (
@@ -23,9 +25,18 @@ from .data import (
 )
 
 
-Architecture = Literal["direct", "cot", "recurrent", "recurrent-r0"]
-PositionEncoding = Literal["sinusoidal", "rope"]
+Architecture = Literal[
+    "direct",
+    "cot",
+    "recurrent",
+    "recurrent-r0",
+    "fan-recurrent",
+    "event-recurrent",
+]
+PositionEncoding = Literal["none", "sinusoidal", "rope"]
 LoopConditioning = Literal["none", "learned"]
+FanInputFormat = Literal["template", "atomic"]
+DirectInputFormat = Literal["template", "atomic"]
 
 
 @dataclass(frozen=True)
@@ -48,12 +59,40 @@ class OriginalModelConfig:
     max_loop_embeddings: int = 64
     adaptive_update_threshold: float = 1e9
     adaptive_min_confidence: float = 0.0
+    fan_input_format: FanInputFormat = "template"
+    fan_positional_control: bool = False
+    direct_input_format: DirectInputFormat = "template"
+    direct_causal: bool = False
 
     def __post_init__(self) -> None:
-        if self.architecture not in ("direct", "cot", "recurrent", "recurrent-r0"):
+        if self.architecture not in (
+            "direct",
+            "cot",
+            "recurrent",
+            "recurrent-r0",
+            "fan-recurrent",
+            "event-recurrent",
+        ):
             raise ValueError(f"unknown architecture: {self.architecture}")
-        if self.position_encoding not in ("sinusoidal", "rope"):
+        if self.position_encoding not in ("none", "sinusoidal", "rope"):
             raise ValueError(f"unknown position encoding: {self.position_encoding}")
+        if self.fan_input_format not in ("template", "atomic"):
+            raise ValueError(f"unknown fan_input_format: {self.fan_input_format}")
+        if self.direct_input_format not in ("template", "atomic"):
+            raise ValueError(f"unknown direct_input_format: {self.direct_input_format}")
+        if self.architecture != "direct" and (
+            self.direct_input_format != "template" or self.direct_causal
+        ):
+            raise ValueError("direct input and causal controls require architecture='direct'")
+        if self.architecture == "fan-recurrent":
+            if self.fan_positional_control:
+                if self.position_encoding != "sinusoidal":
+                    raise ValueError("fan positional control requires position_encoding='sinusoidal'")
+            elif self.position_encoding != "none":
+                raise ValueError(
+                    "fan-recurrent requires position_encoding='none' unless "
+                    "fan_positional_control=True"
+                )
         if self.d_model <= 0 or self.d_model % self.n_heads:
             raise ValueError("d_model must be positive and divisible by n_heads")
         if self.position_encoding == "rope" and (self.d_model // self.n_heads) % 2:
@@ -240,16 +279,17 @@ class TransformerBlock(nn.Module):
 
 
 class TokenBackbone(nn.Module):
-    def __init__(self, config: OriginalModelConfig, vocab_size: int) -> None:
+    def __init__(self, config: OriginalModelConfig, vocab_size: int, *, pad_id: int = PAD_ID) -> None:
         super().__init__()
         self.config = config
-        self.embedding = nn.Embedding(vocab_size, config.d_model, padding_idx=PAD_ID)
+        self.pad_id = pad_id
+        self.embedding = nn.Embedding(vocab_size, config.d_model, padding_idx=pad_id)
         self.sinusoidal = SinusoidalPositionEncoding(config.d_model)
         self.embedding_dropout = nn.Dropout(config.dropout)
         self.final_norm = nn.LayerNorm(config.d_model)
         nn.init.normal_(self.embedding.weight, std=0.02)
         with torch.no_grad():
-            self.embedding.weight[PAD_ID].zero_()
+            self.embedding.weight[pad_id].zero_()
 
     def prepare(self, input_ids: Tensor, attention_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if input_ids.ndim != 2 or input_ids.shape != attention_mask.shape:
@@ -273,7 +313,10 @@ class DirectTransformer(TokenBackbone):
     def __init__(self, config: OriginalModelConfig) -> None:
         if config.architecture != "direct":
             raise ValueError("DirectTransformer requires architecture='direct'")
-        super().__init__(config, VOCAB_SIZE)
+        is_atomic = config.direct_input_format == "atomic"
+        vocab_size = ATOMIC_VOCAB_SIZE if is_atomic else VOCAB_SIZE
+        pad_id = ATOMIC_PAD_ID if is_atomic else PAD_ID
+        super().__init__(config, vocab_size, pad_id=pad_id)
         self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.num_layers))
         self.classifier = Classifier(config.d_model, config.classifier_dim, N_LABELS)
 
@@ -285,7 +328,7 @@ class DirectTransformer(TokenBackbone):
     ) -> Tensor:
         _, h, positions = self.prepare(input_ids, attention_mask)
         for layer in self.layers:
-            h = layer(h, attention_mask, positions, causal=False)
+            h = layer(h, attention_mask, positions, causal=self.config.direct_causal)
         h = self.final_norm(h) * attention_mask.unsqueeze(-1)
         return self.classifier(_gather_slots(h, slot_positions))
 
@@ -347,18 +390,30 @@ class RecurrentTransformer(TokenBackbone):
         slot_positions: Tensor,
         *,
         num_loops: int | None = None,
-    ) -> Tensor:
-        """Return slot logits from every loop for optional deep supervision."""
+        return_hidden_states: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+        """Return shared-classifier logits from every recurrent loop.
+
+        ``return_hidden_states`` exists for graph-integrity tests only.  The
+        states retain their normal autograd links; targets never enter this
+        method or alter the recurrence.
+        """
 
         e, h, positions = self.prepare(input_ids, attention_mask)
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
             raise ValueError("num_loops must be positive")
         outputs = []
+        hidden_states = []
         for _ in range(loops):
             h = self.recurrent_step(e, h, attention_mask, positions)
             outputs.append(self._classify(h, attention_mask, slot_positions))
-        return torch.stack(outputs, dim=1)
+            if return_hidden_states:
+                hidden_states.append(h)
+        loop_logits = torch.stack(outputs, dim=1)
+        if return_hidden_states:
+            return loop_logits, hidden_states
+        return loop_logits
 
     @torch.inference_mode()
     def forward_adaptive(
@@ -422,6 +477,99 @@ class RecurrentTransformer(TokenBackbone):
             "halted": halted,
             "symmetric_kl": kl_history,
         }
+
+
+class FanRecurrentTransformer(TokenBackbone):
+    """Looped Transformer aligned with Fan et al.'s recurrent computation.
+
+    The token embedding is re-injected before every application of the same
+    depth stack::
+
+        h_0 = 0
+        h_k = F_theta(h_{k-1} + embed(x))
+
+    ``F_theta`` is shared across loops and contains ``num_layers`` causal
+    Transformer blocks. The main condition uses NoPE; the explicitly labeled
+    sinusoidal positional control is admitted for either input representation
+    only through ``fan_positional_control``. Targets never enter the recurrence. The
+    default training objective reads only the final state;
+    ``forward_all_loops`` remains available for the pre-existing
+    deep-supervision ablation and evaluation-only probes.
+    """
+
+    def __init__(self, config: OriginalModelConfig) -> None:
+        if config.architecture != "fan-recurrent":
+            raise ValueError("FanRecurrentTransformer requires architecture='fan-recurrent'")
+        is_atomic = config.fan_input_format == "atomic"
+        vocab_size = ATOMIC_VOCAB_SIZE if is_atomic else VOCAB_SIZE
+        pad_id = ATOMIC_PAD_ID if is_atomic else PAD_ID
+        super().__init__(config, vocab_size, pad_id=pad_id)
+        self.shared_layers = nn.ModuleList(
+            TransformerBlock(config) for _ in range(config.num_layers)
+        )
+        self.classifier = Classifier(config.d_model, config.classifier_dim, N_LABELS)
+
+    def recurrent_step(
+        self,
+        embedding: Tensor,
+        hidden: Tensor,
+        attention_mask: Tensor,
+        position_ids: Tensor,
+    ) -> Tensor:
+        hidden = hidden + embedding
+        for layer in self.shared_layers:
+            hidden = layer(hidden, attention_mask, position_ids, causal=True)
+        return hidden * attention_mask.unsqueeze(-1).to(dtype=hidden.dtype)
+
+    def _classify(self, hidden: Tensor, attention_mask: Tensor, slot_positions: Tensor) -> Tensor:
+        normalized = self.final_norm(hidden) * attention_mask.unsqueeze(-1)
+        return self.classifier(_gather_slots(normalized, slot_positions))
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        slot_positions: Tensor,
+        *,
+        num_loops: int | None = None,
+    ) -> Tensor:
+        return self.forward_all_loops(
+            input_ids,
+            attention_mask,
+            slot_positions,
+            num_loops=num_loops,
+        )[:, -1]
+
+    def forward_all_loops(
+        self,
+        input_ids: Tensor,
+        attention_mask: Tensor,
+        slot_positions: Tensor,
+        *,
+        num_loops: int | None = None,
+        return_hidden_states: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+        _, embedding, positions = self.prepare(input_ids, attention_mask)
+        hidden = torch.zeros_like(embedding)
+        loops = self.config.num_loops if num_loops is None else num_loops
+        if loops < 1:
+            raise ValueError("num_loops must be positive")
+        outputs: list[Tensor] = []
+        hidden_states: list[Tensor] = []
+        for _ in range(loops):
+            hidden = self.recurrent_step(
+                embedding,
+                hidden,
+                attention_mask,
+                positions,
+            )
+            outputs.append(self._classify(hidden, attention_mask, slot_positions))
+            if return_hidden_states:
+                hidden_states.append(hidden)
+        loop_logits = torch.stack(outputs, dim=1)
+        if return_hidden_states:
+            return loop_logits, hidden_states
+        return loop_logits
 
 
 class RecurrentR0Transformer(TokenBackbone):
@@ -504,18 +652,31 @@ class RecurrentR0Transformer(TokenBackbone):
         slot_positions: Tensor,
         *,
         num_loops: int | None = None,
-    ) -> Tensor:
+        return_hidden_states: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+        """Return shared-classifier logits without interrupting recurrence.
+
+        Intermediate targets are consumed exclusively by training loss code;
+        this forward path never receives them and therefore cannot use teacher
+        forcing, detachment, or a hidden-state reset between loops.
+        """
         _, h, positions = self.prepare(input_ids, attention_mask)
         loops = self.config.num_loops if num_loops is None else num_loops
         if loops < 1:
             raise ValueError("num_loops must be positive")
         outputs = []
+        hidden_states = []
         for loop_index in range(loops):
             h = self.recurrent_step(
                 h, attention_mask, positions, loop_index=loop_index
             )
             outputs.append(self._classify(h, attention_mask, slot_positions))
-        return torch.stack(outputs, dim=1)
+            if return_hidden_states:
+                hidden_states.append(h)
+        loop_logits = torch.stack(outputs, dim=1)
+        if return_hidden_states:
+            return loop_logits, hidden_states
+        return loop_logits
 
     @torch.inference_mode()
     def forward_adaptive(
@@ -595,6 +756,142 @@ class RecurrentR0Transformer(TokenBackbone):
             "update_ratio": update_history,
             "confidence": confidence_history,
         }
+
+
+class EventWiseRecurrentTransformer(nn.Module):
+    """Shared one-event transition over five position-free latent registers.
+
+    The state chain is never reset or teacher-forced.  At recurrent step ``t``
+    the update block receives only the seven local tokens for event ``t``;
+    neither future events nor a global event/loop position are available.
+    """
+
+    def __init__(self, config: OriginalModelConfig) -> None:
+        super().__init__()
+        if config.architecture != "event-recurrent":
+            raise ValueError("EventWiseRecurrentTransformer requires architecture='event-recurrent'")
+        self.config = config
+        self.register_identity = nn.Embedding(N_ENTITIES, config.d_model)
+        # The final entry represents an inactive/padded register.
+        self.color_embedding = nn.Embedding(N_LABELS + 1, config.d_model)
+        self.event_embedding = nn.Embedding(VOCAB_SIZE, config.d_model, padding_idx=PAD_ID)
+        self.event_local_position = nn.Parameter(torch.empty(EVENT_WIDTH, config.d_model))
+        self.event_type = nn.Parameter(torch.empty(config.d_model))
+        self.embedding_dropout = nn.Dropout(config.dropout)
+        self.shared_update = TransformerBlock(config)
+        self.final_norm = nn.LayerNorm(config.d_model)
+        self.classifier = Classifier(config.d_model, config.classifier_dim, N_LABELS)
+        nn.init.normal_(self.register_identity.weight, std=0.02)
+        nn.init.normal_(self.color_embedding.weight, std=0.02)
+        nn.init.normal_(self.event_embedding.weight, std=0.02)
+        nn.init.normal_(self.event_local_position, std=0.02)
+        nn.init.normal_(self.event_type, std=0.02)
+        with torch.no_grad():
+            self.event_embedding.weight[PAD_ID].zero_()
+
+    def initialize_state(self, initial_colors: Tensor, register_mask: Tensor) -> Tensor:
+        if initial_colors.ndim != 2 or initial_colors.shape[1] != N_ENTITIES:
+            raise ValueError("initial_colors must have shape [B, 5]")
+        if register_mask.shape != initial_colors.shape:
+            raise ValueError("register_mask must match initial_colors")
+        person_ids = torch.arange(N_ENTITIES, device=initial_colors.device).unsqueeze(0)
+        state = self.register_identity(person_ids) + self.color_embedding(initial_colors)
+        state = self.embedding_dropout(state)
+        return state * register_mask.unsqueeze(-1).to(dtype=state.dtype)
+
+    def recurrent_step(
+        self,
+        state: Tensor,
+        event_input_ids: Tensor,
+        register_mask: Tensor,
+        event_active: Tensor,
+    ) -> Tensor:
+        """Apply the one shared neural transition to exactly one event."""
+        if event_input_ids.ndim != 2 or event_input_ids.shape[1] != EVENT_WIDTH:
+            raise ValueError(f"event_input_ids must have shape [B, {EVENT_WIDTH}]")
+        event = self.event_embedding(event_input_ids) * math.sqrt(self.config.d_model)
+        event = event + self.event_local_position.unsqueeze(0) + self.event_type.view(1, 1, -1)
+        event = self.embedding_dropout(event)
+        combined = torch.cat((state, event), dim=1)
+        attention_mask = torch.cat(
+            (
+                register_mask,
+                event_active.long().unsqueeze(1).expand(-1, EVENT_WIDTH),
+            ),
+            dim=1,
+        )
+        # All global positions are deliberately identical.  Event-local order
+        # is represented only by event_local_position, which resets each step.
+        position_ids = torch.zeros_like(attention_mask)
+        candidate = self.shared_update(
+            combined,
+            attention_mask,
+            position_ids,
+            causal=False,
+        )[:, :N_ENTITIES]
+        candidate = candidate * register_mask.unsqueeze(-1).to(dtype=candidate.dtype)
+        return torch.where(event_active[:, None, None].bool(), candidate, state)
+
+    def _classify(self, state: Tensor, register_mask: Tensor) -> Tensor:
+        normalized = self.final_norm(state) * register_mask.unsqueeze(-1).to(dtype=state.dtype)
+        return self.classifier(normalized)
+
+    def classify_initial_state(self, initial_colors: Tensor, register_mask: Tensor) -> Tensor:
+        """Read the event-free registers with the same head used after every event."""
+
+        return self._classify(
+            self.initialize_state(initial_colors, register_mask),
+            register_mask,
+        )
+
+    def forward_all_events(
+        self,
+        initial_colors: Tensor,
+        register_mask: Tensor,
+        event_input_ids: Tensor,
+        event_mask: Tensor,
+        *,
+        return_hidden_states: bool = False,
+    ) -> Tensor | tuple[Tensor, list[Tensor]]:
+        if event_input_ids.ndim != 3 or event_input_ids.shape[2] != EVENT_WIDTH:
+            raise ValueError(f"event_input_ids must have shape [B, T, {EVENT_WIDTH}]")
+        if event_mask.shape != event_input_ids.shape[:2]:
+            raise ValueError("event_mask must have shape [B, T]")
+        if bool((event_mask.sum(dim=1) < 1).any()):
+            raise ValueError("every sample must contain at least one event")
+        state = self.initialize_state(initial_colors, register_mask)
+        outputs = []
+        hidden_states = []
+        for event_index in range(event_input_ids.shape[1]):
+            state = self.recurrent_step(
+                state,
+                event_input_ids[:, event_index],
+                register_mask,
+                event_mask[:, event_index],
+            )
+            outputs.append(self._classify(state, register_mask))
+            if return_hidden_states:
+                hidden_states.append(state)
+        event_logits = torch.stack(outputs, dim=1)
+        if return_hidden_states:
+            return event_logits, hidden_states
+        return event_logits
+
+    def forward(
+        self,
+        initial_colors: Tensor,
+        register_mask: Tensor,
+        event_input_ids: Tensor,
+        event_mask: Tensor,
+    ) -> Tensor:
+        outputs = self.forward_all_events(
+            initial_colors,
+            register_mask,
+            event_input_ids,
+            event_mask,
+        )
+        assert isinstance(outputs, Tensor)
+        return outputs[:, -1]
 
 
 class ExplicitCoTTransformer(TokenBackbone):
@@ -690,7 +987,9 @@ OriginalModel = (
     DirectTransformer
     | ExplicitCoTTransformer
     | RecurrentTransformer
+    | FanRecurrentTransformer
     | RecurrentR0Transformer
+    | EventWiseRecurrentTransformer
 )
 
 
@@ -701,6 +1000,10 @@ def build_model(config: OriginalModelConfig) -> OriginalModel:
         return ExplicitCoTTransformer(config)
     if config.architecture == "recurrent-r0":
         return RecurrentR0Transformer(config)
+    if config.architecture == "fan-recurrent":
+        return FanRecurrentTransformer(config)
+    if config.architecture == "event-recurrent":
+        return EventWiseRecurrentTransformer(config)
     return RecurrentTransformer(config)
 
 

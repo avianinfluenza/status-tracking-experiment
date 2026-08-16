@@ -29,13 +29,38 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
         "r0": "recurrent-r0",
         "recurrent_r0": "recurrent-r0",
         "looped_r0": "recurrent-r0",
+        "fan": "fan-recurrent",
+        "fan_recurrent": "fan-recurrent",
+        "fan_atomic": "fan-recurrent",
+        "event_wise": "event-recurrent",
+        "event_recurrent": "event-recurrent",
     }
     architecture = aliases.get(str(architecture).lower(), architecture)
-    if architecture not in ("direct", "cot", "recurrent", "recurrent-r0"):
-        raise ValueError("config architecture must be direct, cot, recurrent, or recurrent-r0")
+    if architecture not in (
+        "direct",
+        "cot",
+        "recurrent",
+        "recurrent-r0",
+        "fan-recurrent",
+        "event-recurrent",
+    ):
+        raise ValueError(
+            "config architecture must be direct, cot, recurrent, recurrent-r0, "
+            "fan-recurrent, or event-recurrent"
+        )
 
     arguments = ["--architecture", str(architecture)]
     _append(arguments, "--position-encoding", config.get("position_encoding", model.get("position_encoding")))
+    _append(arguments, "--fan-input-format", config.get("fan_input_format", model.get("fan_input_format")))
+    _append(arguments, "--direct-input-format", config.get("direct_input_format", model.get("direct_input_format")))
+    direct_causal = config.get("direct_causal", model.get("direct_causal"))
+    if direct_causal:
+        arguments.append("--direct-causal")
+    fan_positional_control = config.get(
+        "fan_positional_control", model.get("fan_positional_control")
+    )
+    if fan_positional_control:
+        arguments.append("--fan-positional-control")
     _append(arguments, "--d-model", config.get("d_model", model.get("d_model")))
     _append(arguments, "--n-heads", config.get("n_heads", model.get("n_heads")))
     _append(arguments, "--d-ff", config.get("d_ff", model.get("d_ff")))
@@ -44,6 +69,16 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
     _append(arguments, "--num-loops", config.get("num_loops", model.get("num_loops")))
     _append(arguments, "--classifier-dim", config.get("classifier_dim", model.get("classifier_dim")))
     _append(arguments, "--epochs", training.get("epochs"))
+    if training.get("online_training"):
+        arguments.append("--online-training")
+    _append(arguments, "--train-steps", training.get("train_steps"))
+    _append(arguments, "--curriculum-min-swaps", training.get("curriculum_min_swaps"))
+    _append(arguments, "--curriculum-max-swaps", training.get("curriculum_max_swaps"))
+    _append(
+        arguments,
+        "--curriculum-steps-per-length",
+        training.get("curriculum_steps_per_length"),
+    )
     _append(arguments, "--batch-size", training.get("batch_size"))
     _append(arguments, "--lr", training.get("learning_rate"))
     _append(arguments, "--weight-decay", training.get("weight_decay"))
@@ -70,14 +105,22 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
         arguments.append("--random-loops")
     _append(arguments, "--random-min-loops", training.get("random_min_loops"))
     _append(arguments, "--random-max-loops", training.get("random_max_loops"))
+    _append(arguments, "--swaps-per-loop", training.get("swaps_per_loop"))
     loop_counts = config.get("eval_loop_counts") or dict(config.get("evaluation") or {}).get("loop_counts")
     if loop_counts:
         arguments.append("--eval-loop-counts")
         arguments.extend(map(str, loop_counts))
     _append(arguments, "--deep-supervision-weight", ablations.get("deep_supervision_weight"))
+    if config.get("trajectory_probe_eval") or dict(config.get("evaluation") or {}).get("trajectory_probe_eval"):
+        arguments.append("--trajectory-probe-eval")
+    if dict(config.get("evaluation") or {}).get("event_trajectory_probe"):
+        arguments.append("--event-trajectory-probe")
+    if dict(config.get("evaluation") or {}).get("length_matched_eval"):
+        arguments.append("--length-matched-eval")
     _append(arguments, "--noop-eval-ratio", ablations.get("noop_eval_ratio"))
     if architecture in ("recurrent", "recurrent-r0") and halting.get("enabled_at_evaluation"):
         arguments.append("--adaptive-kl-eval")
+        _append(arguments, "--adaptive-max-loops", halting.get("max_loops"))
     if config.get("progress") is False:
         arguments.append("--no-progress")
     if config.get("slot_first", (config.get("model") or {}).get("slot_first", False)):

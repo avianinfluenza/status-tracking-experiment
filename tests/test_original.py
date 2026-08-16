@@ -10,19 +10,35 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from src.data.collate import collate_fn
+from src.data.atomic import ATOMIC_PAD_ID, ATOMIC_SLOT_IDS, ATOMIC_VOCAB_SIZE
+from src.data.data import GenConfig, make_balanced_length_sweep
 from src.original.analysis import flatten_result, summarize_rows
 from src.original.data import (
     COLOR_IDS,
+    DeterministicOnlineBatchStream,
     RowsDataset,
     build_cot_example,
     collate_cot,
     inject_noop_swaps,
     replay_states,
 )
-from src.original.experiment import parse_args, run, train_epoch
+from src.original.experiment import (
+    SwapCountBatchSampler,
+    build_run_name,
+    fan_learning_rate_multiplier,
+    length_proportional_loop_counts,
+    parse_args,
+    noop_event_input_ids,
+    proportional_target_indices,
+    run,
+    swap_chunk_target_indices,
+    train_epoch,
+)
 from src.original.model import (
     DirectTransformer,
+    EventWiseRecurrentTransformer,
     ExplicitCoTTransformer,
+    FanRecurrentTransformer,
     OriginalModelConfig,
     RecurrentR0Transformer,
     RecurrentTransformer,
@@ -40,7 +56,78 @@ def sample_row() -> dict[str, object]:
     }
 
 
+def trajectory_row() -> dict[str, object]:
+    row = sample_row()
+    row["intermediate_states"] = replay_states(row["init"], row["swaps"])  # type: ignore[arg-type]
+    return row
+
+
+def test_boundary_sweep_is_balanced_deterministic_and_unique() -> None:
+    cfg = GenConfig(min_swaps=11, max_swaps=13, seed=7, profile="boundary_sweep_v1")
+    first = make_balanced_length_sweep(4, cfg)
+    second = make_balanced_length_sweep(4, cfg)
+    assert first == second
+    assert {length: sum(row["n_swaps"] == length for row in first) for length in range(11, 14)} == {
+        11: 4,
+        12: 4,
+        13: 4,
+    }
+    keys = {(tuple(row["init"]), tuple(map(tuple, row["swaps"]))) for row in first}
+    assert len(keys) == len(first)
+
+
+def test_online_curriculum_is_reproducible_and_final_label_only() -> None:
+    settings = dict(
+        num_steps=3,
+        batch_size=4,
+        seed=17,
+        min_swaps=2,
+        max_swaps=4,
+        steps_per_length=1,
+    )
+    first = DeterministicOnlineBatchStream(**settings)
+    second = DeterministicOnlineBatchStream(**settings)
+    assert [first.curriculum_max_swaps(step) for step in range(3)] == [2, 3, 4]
+    for step, (left, right) in enumerate(zip(first, second, strict=True)):
+        assert "trajectory_labels" not in left
+        assert set(left) == set(right)
+        for key in left:
+            torch.testing.assert_close(left[key], right[key])
+        assert bool((left["n_swaps"] == left["n_swaps"][0]).all())
+        assert 2 <= int(left["n_swaps"][0]) <= first.curriculum_max_swaps(step)
+
+    different = next(iter(DeterministicOnlineBatchStream(**{**settings, "seed": 18})))
+    original = next(iter(DeterministicOnlineBatchStream(**settings)))
+    assert not torch.equal(different["input_ids"], original["input_ids"])
+
+
+def test_atomic_online_curriculum_is_reproducible_and_uses_atomic_slots() -> None:
+    settings = dict(
+        num_steps=2,
+        batch_size=3,
+        seed=17,
+        min_swaps=2,
+        max_swaps=2,
+        steps_per_length=1,
+        input_format="atomic",
+    )
+    first = next(iter(DeterministicOnlineBatchStream(**settings)))
+    second = next(iter(DeterministicOnlineBatchStream(**settings)))
+    torch.testing.assert_close(first["input_ids"], second["input_ids"])
+    assert int(first["input_ids"].max()) < ATOMIC_VOCAB_SIZE
+    assert first["input_ids"][0, -5:].tolist() == list(ATOMIC_SLOT_IDS)
+    assert int(first["input_ids"].min()) >= ATOMIC_PAD_ID
+
+
+def test_fan_lr_is_constant_through_curriculum_then_cosine_decays() -> None:
+    assert fan_learning_rate_multiplier(8, train_steps=100, curriculum_steps=8) == 1.0
+    assert fan_learning_rate_multiplier(54, train_steps=100, curriculum_steps=8) == pytest.approx(0.5)
+    assert fan_learning_rate_multiplier(100, train_steps=100, curriculum_steps=8) == pytest.approx(0.0)
+
+
 def tiny_config(architecture: str, position_encoding: str = "sinusoidal") -> OriginalModelConfig:
+    if architecture == "fan-recurrent" and position_encoding == "sinusoidal":
+        position_encoding = "none"
     return OriginalModelConfig(
         architecture=architecture,  # type: ignore[arg-type]
         position_encoding=position_encoding,  # type: ignore[arg-type]
@@ -67,13 +154,154 @@ def test_symbolic_trace_matches_all_five_final_labels() -> None:
 
 def test_slot_first_collation_uses_fixed_register_positions() -> None:
     short = sample_row()
-    long = {**sample_row(), "swaps": sample_row()["swaps"] + [[0, 2], [2, 4]]}
+    long = {
+        **sample_row(),
+        "swaps": sample_row()["swaps"] + [[0, 2], [2, 4]],
+        "n_swaps": 5,
+    }
     batch = collate_fn([short, long], slot_first=True)
     assert batch["slot_pos"].tolist() == [[0, 1, 2, 3, 4]] * 2
     assert batch["input_ids"][:, :5].tolist() == [batch["input_ids"][0, :5].tolist()] * 2
     assert batch["attn_mask"][:, :5].tolist() == [[1, 1, 1, 1, 1]] * 2
     assert batch["attn_mask"][0, -1].item() == 0
     assert batch["attn_mask"][1, -1].item() == 1
+
+
+def test_event_collation_exposes_local_events_and_fixed_register_inputs() -> None:
+    short = sample_row()
+    short["swaps"] = short["swaps"][:1]
+    short["n_swaps"] = 1
+    short["labels"] = replay_states(short["init"], short["swaps"])[-1]  # type: ignore[arg-type]
+    batch = collate_fn([short, sample_row()])
+    assert batch["initial_colors"].shape == (2, 5)
+    assert batch["register_mask"].tolist() == [[1] * 5, [1] * 5]
+    assert batch["event_input_ids"].shape == (2, 3, 7)
+    assert batch["event_mask"].tolist() == [[1, 0, 0], [1, 1, 1]]
+
+
+def test_event_recurrence_cannot_see_future_events_and_preserves_padded_state() -> None:
+    first = sample_row()
+    second = copy.deepcopy(first)
+    second["swaps"][1] = [0, 3]  # type: ignore[index]
+    second["labels"] = replay_states(second["init"], second["swaps"])[-1]  # type: ignore[arg-type]
+    batch = collate_fn([first, second])
+    model = EventWiseRecurrentTransformer(tiny_config("event-recurrent"))
+    outputs = model.forward_all_events(
+        batch["initial_colors"],
+        batch["register_mask"],
+        batch["event_input_ids"],
+        batch["event_mask"],
+    )
+    assert isinstance(outputs, torch.Tensor)
+    torch.testing.assert_close(outputs[0, 0], outputs[1, 0])
+
+    short = copy.deepcopy(first)
+    short["swaps"] = short["swaps"][:1]  # type: ignore[index]
+    short["n_swaps"] = 1
+    short["labels"] = replay_states(short["init"], short["swaps"])[-1]  # type: ignore[arg-type]
+    padded = collate_fn([short, first])
+    padded_outputs = model.forward_all_events(
+        padded["initial_colors"],
+        padded["register_mask"],
+        padded["event_input_ids"],
+        padded["event_mask"],
+    )
+    assert isinstance(padded_outputs, torch.Tensor)
+    torch.testing.assert_close(padded_outputs[0, 0], padded_outputs[0, -1])
+
+
+def test_event_recurrence_final_gradient_reaches_first_event_state() -> None:
+    batch = collate_fn([sample_row()])
+    model = EventWiseRecurrentTransformer(tiny_config("event-recurrent"))
+    outputs, states = model.forward_all_events(
+        batch["initial_colors"],
+        batch["register_mask"],
+        batch["event_input_ids"],
+        batch["event_mask"],
+        return_hidden_states=True,
+    )
+    gradient = torch.autograd.grad(outputs[:, -1].sum(), states[0])[0]
+    assert torch.isfinite(gradient).all()
+    assert gradient.abs().sum().item() > 0.0
+
+
+def test_event_initial_readout_reuses_classifier_and_updates_register_encoder() -> None:
+    batch = collate_fn([sample_row()])
+    model = EventWiseRecurrentTransformer(tiny_config("event-recurrent"))
+    logits = model.classify_initial_state(
+        batch["initial_colors"],
+        batch["register_mask"],
+    )
+    loss = torch.nn.functional.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        batch["initial_colors"].reshape(-1),
+    )
+    loss.backward()
+    assert model.register_identity.weight.grad is not None
+    assert model.classifier.classifier[-1].weight.grad is not None
+    assert model.shared_update.attention.qkv.weight.grad is None
+
+
+def test_noop_probe_encoder_builds_active_self_swaps() -> None:
+    encoded = noop_event_input_ids(torch.tensor([0, 4], dtype=torch.long))
+    assert encoded.shape == (2, 7)
+    assert torch.equal(encoded[:, 0], encoded[:, 2])
+
+
+def test_trajectory_collation_pads_ragged_swap_traces_and_slots() -> None:
+    short = trajectory_row()
+    long = trajectory_row()
+    long["swaps"] = [[0, 1], [1, 4], [2, 3], [0, 2], [2, 4]]
+    long["intermediate_states"] = replay_states(long["init"], long["swaps"])  # type: ignore[arg-type]
+    long["labels"] = long["intermediate_states"][-1]  # type: ignore[index]
+    long["n_swaps"] = 5
+    batch = collate_fn([short, long])
+    assert batch["trajectory_labels"].shape == (2, 5, 5)
+    assert batch["trajectory_labels"][0, :3].tolist() == short["intermediate_states"]
+    assert batch["trajectory_labels"][0, 3:].tolist() == [[-100] * 5, [-100] * 5]
+
+
+@pytest.mark.parametrize(
+    ("loops", "swaps", "expected"),
+    [
+        (24, [4, 8], [[0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3],
+                     [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7]]),
+        (6, [10], [[1, 3, 4, 6, 8, 9]]),
+        (4, [4], [[0, 1, 2, 3]]),
+    ],
+)
+def test_proportional_trajectory_mapping_handles_loop_length_mismatches(
+    loops: int, swaps: list[int], expected: list[list[int]]
+) -> None:
+    assert proportional_target_indices(loops, torch.tensor(swaps)).tolist() == expected
+
+
+def test_swap_chunk_targets_and_batch_sampler_share_length_proportional_budget() -> None:
+    n_swaps = torch.tensor([3, 4, 5, 6])
+    assert length_proportional_loop_counts(n_swaps, 2).tolist() == [2, 2, 3, 3]
+    assert length_proportional_loop_counts(torch.tensor([2, 3, 10]), 0.5).tolist() == [4, 6, 20]
+    assert swap_chunk_target_indices(4, torch.tensor([4, 7]), 2).tolist() == [
+        [1, 3, 3, 3],
+        [1, 3, 5, 6],
+    ]
+    assert swap_chunk_target_indices(8, torch.tensor([4]), 0.5).tolist() == [
+        [0, 0, 1, 1, 2, 2, 3, 3],
+    ]
+    rows = []
+    for count in n_swaps.tolist():
+        row = trajectory_row()
+        swaps = [[0, 1]] * count
+        row["swaps"] = swaps
+        row["n_swaps"] = count
+        row["intermediate_states"] = replay_states(row["init"], swaps)  # type: ignore[arg-type]
+        row["labels"] = row["intermediate_states"][-1]  # type: ignore[index]
+        rows.append(row)
+    sampler = SwapCountBatchSampler(
+        RowsDataset(rows), batch_size=2, swaps_per_loop=2, shuffle=False, seed=0
+    )
+    for indices in sampler:
+        loop_counts = {(int(rows[index]["n_swaps"]) + 1) // 2 for index in indices}
+        assert len(loop_counts) == 1
 
 
 @pytest.mark.parametrize("position_encoding", ["sinusoidal", "rope"])
@@ -90,6 +318,16 @@ class ZeroBlock(nn.Module):
         return torch.zeros_like(h)
 
 
+class IdentityRecordingBlock(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.causal_values: list[bool] = []
+
+    def forward(self, h, attention_mask, position_ids, *, causal):
+        self.causal_values.append(causal)
+        return h * attention_mask.unsqueeze(-1)
+
+
 def test_recurrent_update_is_exactly_embedding_plus_block_output() -> None:
     batch = collate_fn([sample_row()])
     model = RecurrentTransformer(tiny_config("recurrent"))
@@ -98,6 +336,111 @@ def test_recurrent_update_is_exactly_embedding_plus_block_output() -> None:
     updated = model.recurrent_step(e, h, batch["attn_mask"], positions)
     expected = e * batch["attn_mask"].unsqueeze(-1)
     torch.testing.assert_close(updated, expected)
+
+
+def test_fan_recurrence_starts_at_zero_and_reinjects_nope_embedding() -> None:
+    batch = collate_fn([sample_row()])
+    model = FanRecurrentTransformer(tiny_config("fan-recurrent"))
+    blocks = nn.ModuleList([IdentityRecordingBlock(), IdentityRecordingBlock()])
+    model.shared_layers = blocks
+    _, embedding, _ = model.prepare(batch["input_ids"], batch["attn_mask"])
+    _, hidden_states = model.forward_all_loops(
+        batch["input_ids"],
+        batch["attn_mask"],
+        batch["slot_pos"],
+        return_hidden_states=True,
+    )
+    mask = batch["attn_mask"].unsqueeze(-1)
+    for loop_index, hidden in enumerate(hidden_states, start=1):
+        torch.testing.assert_close(hidden, loop_index * embedding * mask)
+    assert all(value is True for block in blocks for value in block.causal_values)
+
+
+def test_fan_model_rejects_position_encodings() -> None:
+    with pytest.raises(ValueError, match="requires position_encoding='none'"):
+        OriginalModelConfig(architecture="fan-recurrent", position_encoding="sinusoidal")
+
+
+def test_fan_controls_require_explicit_compatible_configurations() -> None:
+    positional = OriginalModelConfig(
+        architecture="fan-recurrent",
+        position_encoding="sinusoidal",
+        fan_positional_control=True,
+    )
+    atomic = OriginalModelConfig(
+        architecture="fan-recurrent",
+        position_encoding="none",
+        fan_input_format="atomic",
+    )
+    atomic_positional = OriginalModelConfig(
+        architecture="fan-recurrent",
+        position_encoding="sinusoidal",
+        fan_input_format="atomic",
+        fan_positional_control=True,
+    )
+    assert positional.fan_positional_control is True
+    assert atomic.fan_input_format == "atomic"
+    assert atomic_positional.fan_positional_control is True
+    with pytest.raises(ValueError, match="requires position_encoding='none'"):
+        OriginalModelConfig(
+            architecture="fan-recurrent",
+            position_encoding="sinusoidal",
+            fan_input_format="atomic",
+        )
+
+
+def test_atomic_fan_model_reads_atomic_collation() -> None:
+    batch = collate_fn([sample_row()], input_format="atomic")
+    model = FanRecurrentTransformer(
+        OriginalModelConfig(
+            architecture="fan-recurrent",
+            position_encoding="none",
+            fan_input_format="atomic",
+            d_model=16,
+            n_heads=4,
+            d_ff=32,
+            num_layers=1,
+            num_loops=2,
+        )
+    )
+    logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+    assert logits.shape == (1, 5, 5)
+
+
+def test_atomic_causal_direct_model_reads_atomic_collation() -> None:
+    batch = collate_fn([sample_row()], input_format="atomic")
+    model = DirectTransformer(
+        OriginalModelConfig(
+            architecture="direct",
+            position_encoding="none",
+            direct_input_format="atomic",
+            direct_causal=True,
+            d_model=16,
+            n_heads=4,
+            d_ff=32,
+            num_layers=2,
+        )
+    )
+    blocks = nn.ModuleList([IdentityRecordingBlock(), IdentityRecordingBlock()])
+    model.layers = blocks
+    logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+    assert logits.shape == (1, 5, 5)
+    assert all(value is True for block in blocks for value in block.causal_values)
+
+
+def test_online_direct_baseline_requires_atomic_causal_nope() -> None:
+    with pytest.raises(ValueError, match="atomic input, causal attention, and NoPE"):
+        run(
+            parse_args(
+                [
+                    "--architecture",
+                    "direct",
+                    "--online-training",
+                    "--smoke",
+                    "--no-progress",
+                ]
+            )
+        )
 
 
 def test_recurrent_r0_update_does_not_reinject_embedding() -> None:
@@ -172,10 +515,30 @@ def test_recurrent_exposes_every_loop_for_optional_deep_supervision() -> None:
     ), logits[:, -1])
 
 
-def test_deep_supervision_training_ablation_runs() -> None:
+@pytest.mark.parametrize("architecture", ["recurrent", "recurrent-r0", "fan-recurrent"])
+def test_final_readout_gradient_reaches_first_recurrent_hidden_state(architecture: str) -> None:
+    batch = collate_fn([trajectory_row()])
+    model = {
+        "recurrent": RecurrentTransformer,
+        "recurrent-r0": RecurrentR0Transformer,
+        "fan-recurrent": FanRecurrentTransformer,
+    }[architecture](tiny_config(architecture))
+    loop_logits, hidden_states = model.forward_all_loops(
+        batch["input_ids"], batch["attn_mask"], batch["slot_pos"], return_hidden_states=True
+    )
+    first_loop_gradient = torch.autograd.grad(loop_logits[:, -1].sum(), hidden_states[0])[0]
+    assert torch.isfinite(first_loop_gradient).all()
+    assert first_loop_gradient.abs().sum().item() > 0.0
+
+
+@pytest.mark.parametrize("architecture", ["recurrent", "fan-recurrent"])
+def test_deep_supervision_training_ablation_runs(architecture: str) -> None:
     rows = [sample_row(), sample_row()]
     loader = DataLoader(RowsDataset(rows), batch_size=2, collate_fn=collate_fn)
-    model = RecurrentTransformer(tiny_config("recurrent"))
+    model = {
+        "recurrent": RecurrentTransformer,
+        "fan-recurrent": FanRecurrentTransformer,
+    }[architecture](tiny_config(architecture))
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     loss = train_epoch(
         model,
@@ -184,6 +547,21 @@ def test_deep_supervision_training_ablation_runs() -> None:
         torch.device("cpu"),
         grad_clip=1.0,
         deep_supervision_weight=0.5,
+    )
+    assert loss > 0.0
+
+
+def test_event_recurrent_training_uses_final_ce_only() -> None:
+    rows = [sample_row(), sample_row()]
+    loader = DataLoader(RowsDataset(rows), batch_size=2, collate_fn=collate_fn)
+    model = EventWiseRecurrentTransformer(tiny_config("event-recurrent"))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    loss = train_epoch(
+        model,
+        loader,
+        optimizer,
+        torch.device("cpu"),
+        grad_clip=1.0,
     )
     assert loss > 0.0
 
@@ -199,12 +577,13 @@ def test_cot_targets_only_colors_after_slot_prompts() -> None:
 
 
 def test_noop_robustness_view_preserves_gold_state() -> None:
-    row = sample_row()
+    row = trajectory_row()
     augmented = inject_noop_swaps([row], ratio=0.5, seed=7)[0]
     assert augmented["labels"] == row["labels"]
     assert augmented["n_swaps"] == 5
     assert replay_states(augmented["init"], augmented["swaps"])[-1] == row["labels"]  # type: ignore[arg-type]
     assert any(left == right for left, right in augmented["swaps"])  # type: ignore[assignment]
+    assert augmented["intermediate_states"] == replay_states(augmented["init"], augmented["swaps"])  # type: ignore[arg-type]
 
 
 def test_cot_evaluation_does_not_read_stored_final_labels() -> None:
@@ -298,9 +677,151 @@ def test_slot_first_cli_accepts_snake_case_boolean_value() -> None:
     assert arguments.slot_first is True
 
 
+def test_slot_first_run_name_records_the_ablation() -> None:
+    arguments = parse_args(["--architecture", "recurrent-r0", "--slot-first"])
+    assert "slotfirst" in build_run_name(arguments)
+
+
 def test_slot_first_yaml_config_maps_to_cli() -> None:
     arguments = config_to_argv({"architecture": "direct", "slot_first": True})
     assert "--slot-first" in arguments
+
+
+def test_event_recurrent_yaml_alias_maps_to_cli() -> None:
+    arguments = config_to_argv({"architecture": "event_recurrent"})
+    assert arguments[:2] == ["--architecture", "event-recurrent"]
+
+
+def test_event_probe_yaml_config_maps_to_cli() -> None:
+    arguments = config_to_argv({
+        "architecture": "event-recurrent",
+        "evaluation": {"event_trajectory_probe": True},
+    })
+    assert "--event-intermediate-weight" not in arguments
+    assert "--event-initial-state-weight" not in arguments
+    assert "--event-noop-consistency-weight" not in arguments
+    assert "--event-trajectory-probe" in arguments
+
+
+def test_trajectory_probe_yaml_config_maps_to_cli() -> None:
+    arguments = config_to_argv({
+        "architecture": "recurrent",
+        "evaluation": {"trajectory_probe_eval": True},
+    })
+    assert "--trajectory-supervision" not in arguments
+    assert "--trajectory-supervision-weight" not in arguments
+    assert "--trajectory-probe-eval" in arguments
+
+
+def test_removed_auxiliary_loss_cli_flags_are_rejected() -> None:
+    for removed_flag in (
+        "--trajectory-supervision",
+        "--trajectory-supervision-weight",
+        "--event-intermediate-weight",
+        "--event-initial-state-weight",
+        "--event-noop-consistency-weight",
+    ):
+        with pytest.raises(SystemExit):
+            parse_args(["--architecture", "recurrent", removed_flag, "0.1"])
+
+
+def test_recurrent_cli_rejects_invalid_combinations(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="require a recurrent model"):
+        run(parse_args([
+            "--architecture", "direct", "--trajectory-probe-eval", "--output-dir", str(tmp_path),
+        ]))
+    with pytest.raises(ValueError, match="requires --adaptive-kl-eval"):
+        run(parse_args([
+            "--architecture", "recurrent", "--adaptive-max-loops", "24", "--output-dir", str(tmp_path),
+        ]))
+    with pytest.raises(ValueError, match="requires --swaps-per-loop"):
+        run(parse_args([
+            "--architecture", "recurrent", "--length-matched-eval", "--output-dir", str(tmp_path),
+        ]))
+    with pytest.raises(ValueError, match="does not apply"):
+        run(parse_args([
+            "--architecture", "event-recurrent", "--slot-first", "--output-dir", str(tmp_path),
+        ]))
+    with pytest.raises(ValueError, match="requires --architecture event-recurrent"):
+        run(parse_args([
+            "--architecture", "recurrent", "--event-trajectory-probe",
+            "--output-dir", str(tmp_path),
+        ]))
+
+
+def test_event_trajectory_probe_runs_in_smoke_experiment(tmp_path: Path) -> None:
+    result = run(parse_args([
+        "--architecture", "event-recurrent",
+        "--smoke",
+        "--device", "cpu",
+        "--no-progress",
+        "--event-trajectory-probe",
+        "--output-dir", str(tmp_path),
+    ]))
+    probe = result["splits"]["id_test"]["event_trajectory_probe"]
+    assert probe["evaluation_mode"] == "event_aligned_trajectory"
+    assert probe["initial_state"]["n_samples"] == 4
+    assert probe["update_norms"]["real_relative_l2"] > 0.0
+    assert probe["update_norms"]["noop_relative_l2"] > 0.0
+    assert probe["events"]
+
+
+def test_trajectory_probe_records_each_requested_loop_count(tmp_path: Path) -> None:
+    result = run(parse_args([
+        "--architecture", "recurrent",
+        "--smoke",
+        "--device", "cpu",
+        "--no-progress",
+        "--trajectory-probe-eval",
+        "--swaps-per-loop", "2",
+        "--length-matched-eval",
+        "--eval-loop-counts", "1", "2",
+        "--output-dir", str(tmp_path),
+    ]))
+    probe = result["splits"]["id_test"]["trajectory_probe"]
+    assert set(probe) == {"1", "2"}
+    assert len(probe["1"]["loops"]) == 1
+    assert len(probe["2"]["loops"]) == 2
+    oracle = result["splits"]["id_test"]["length_matched_oracle"]
+    assert oracle["evaluation_mode"] == "length_matched_oracle"
+    assert oracle["swaps_per_loop"] == 2
+    assert sum(oracle["loop_count_histogram"].values()) == oracle["n_samples"]
+
+
+def test_fan_yaml_maps_online_curriculum_to_cli() -> None:
+    arguments = config_to_argv({
+        "architecture": "fan_recurrent",
+        "position_encoding": "none",
+        "training": {
+            "online_training": True,
+            "train_steps": 100,
+            "swaps_per_loop": 1.0,
+            "curriculum_min_swaps": 2,
+            "curriculum_max_swaps": 10,
+            "curriculum_steps_per_length": 5,
+        },
+    })
+    assert arguments[:2] == ["--architecture", "fan-recurrent"]
+    assert "--online-training" in arguments
+    assert arguments[arguments.index("--train-steps") + 1] == "100"
+    assert arguments[arguments.index("--curriculum-max-swaps") + 1] == "10"
+
+
+def test_fan_smoke_uses_length_matched_final_only_training(tmp_path: Path) -> None:
+    result = run(parse_args([
+        "--architecture", "fan-recurrent",
+        "--position-encoding", "none",
+        "--online-training",
+        "--swaps-per-loop", "1",
+        "--smoke",
+        "--device", "cpu",
+        "--no-progress",
+        "--output-dir", str(tmp_path),
+    ]))
+    assert result["track"] == "fan_aligned"
+    assert result["training_regime"]["objective"] == "final_ce_only"
+    assert result["training_regime"]["optimizer_steps"] == 2
+    assert result["splits"]["id_test"]["evaluation_mode"] == "length_matched"
 
 
 def test_r0_yaml_config_maps_advanced_ball_swap_options() -> None:

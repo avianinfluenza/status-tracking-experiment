@@ -11,13 +11,14 @@ from __future__ import annotations
 import copy
 import random
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import torch
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from ..data.collate import BallSwapDataset, encode_body
+from ..data.collate import BallSwapDataset, collate_fn, encode_body
+from ..data.data import GenConfig, sample_problem, to_row
 from ..data.vocab import COLORS, N_ENTITIES, PAD_ID, SLOTS, TOK2ID, VOCAB_SIZE
 
 
@@ -28,6 +29,95 @@ END_STATE_ID = VOCAB_SIZE + 2
 COT_VOCAB_SIZE = VOCAB_SIZE + 3
 COLOR_IDS = tuple(TOK2ID[color] for color in COLORS)
 SLOT_TOKEN_IDS = tuple(TOK2ID[slot] for slot in SLOTS)
+
+
+def _stream_seed(base_seed: int, step: int, sample: int) -> int:
+    """Mix online-example coordinates into a stable 64-bit RNG seed."""
+
+    value = (
+        (base_seed & 0xFFFFFFFFFFFFFFFF)
+        ^ ((step + 1) * 0x9E3779B97F4A7C15)
+        ^ ((sample + 1) * 0xBF58476D1CE4E5B9)
+    ) & 0xFFFFFFFFFFFFFFFF
+    value ^= value >> 30
+    value = (value * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    value ^= value >> 27
+    value = (value * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return value ^ (value >> 31)
+
+
+class DeterministicOnlineBatchStream(Iterable[dict[str, Tensor]]):
+    """Generate reproducible i.i.d. training batches from step coordinates.
+
+    A step first samples one swap length from the currently available
+    curriculum range, then generates a fresh batch at that exact length.  The
+    shared length lets every sample use the same recurrent budget.  All RNGs
+    are derived from ``(seed, step, sample_index)``; rerunning with the same
+    arguments recreates every token and target exactly, independent of global
+    Python or PyTorch RNG state.
+
+    Intermediate states are deliberately removed before collation so this
+    training stream can support final-state CE (and the retained deep-
+    supervision ablation) but cannot accidentally use trajectory labels.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_steps: int,
+        batch_size: int,
+        seed: int,
+        min_swaps: int,
+        max_swaps: int,
+        steps_per_length: int,
+        slot_first: bool = False,
+        input_format: str = "template",
+    ) -> None:
+        if num_steps < 1 or batch_size < 1 or steps_per_length < 1:
+            raise ValueError("num_steps, batch_size, and steps_per_length must be positive")
+        if not 1 <= min_swaps <= max_swaps:
+            raise ValueError("curriculum swap range must satisfy 1 <= min <= max")
+        self.num_steps = num_steps
+        self.batch_size = batch_size
+        self.seed = seed
+        self.min_swaps = min_swaps
+        self.max_swaps = max_swaps
+        self.steps_per_length = steps_per_length
+        self.slot_first = slot_first
+        if input_format not in {"template", "atomic"}:
+            raise ValueError("input_format must be 'template' or 'atomic'")
+        self.input_format = input_format
+
+    def __len__(self) -> int:
+        return self.num_steps
+
+    def curriculum_max_swaps(self, step: int) -> int:
+        if not 0 <= step < self.num_steps:
+            raise IndexError("online training step is out of range")
+        return min(self.max_swaps, self.min_swaps + step // self.steps_per_length)
+
+    def _batch_for_step(self, step: int) -> dict[str, Tensor]:
+        current_max = self.curriculum_max_swaps(step)
+        length_rng = random.Random(_stream_seed(self.seed, step, 0))
+        n_swaps = length_rng.randint(self.min_swaps, current_max)
+        config = GenConfig(
+            n_entities=N_ENTITIES,
+            min_swaps=n_swaps,
+            max_swaps=n_swaps,
+            seed=self.seed,
+            profile="fan_online_curriculum_v1",
+        )
+        rows: list[dict[str, object]] = []
+        for sample_index in range(self.batch_size):
+            rng = random.Random(_stream_seed(self.seed, step, sample_index + 1))
+            row = to_row(sample_problem(rng, config), config)
+            row.pop("intermediate_states", None)
+            rows.append(row)
+        return collate_fn(rows, slot_first=self.slot_first, input_format=self.input_format)
+
+    def __iter__(self) -> Iterator[dict[str, Tensor]]:
+        for step in range(self.num_steps):
+            yield self._batch_for_step(step)
 
 
 def replay_states(init: Sequence[int], swaps: Sequence[Sequence[int]]) -> list[list[int]]:
@@ -165,6 +255,8 @@ def inject_noop_swaps(
             swaps.insert(position, [entity, entity])
         result["swaps"] = swaps
         result["n_swaps"] = len(swaps)
+        if "intermediate_states" in result:
+            result["intermediate_states"] = replay_states(result["init"], swaps)  # type: ignore[arg-type]
         augmented.append(result)
     return augmented
 
