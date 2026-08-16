@@ -23,6 +23,52 @@ PYTHON_BIN="${PYTHON_BIN:-}"
 
 read -r -a FIXED_LOOP_COUNTS <<< "${FIXED_LOOP_COUNTS:-20 24 40 64 128}"
 
+TOTAL_RUNS=8
+COMPLETED_RUNS=0
+RUN_INDEX=0
+CURRENT_LABEL=""
+
+trap 'echo "[error] failed while running: ${CURRENT_LABEL:-unknown}" >&2' ERR
+
+print_plan() {
+  echo "Experiment queue (${TOTAL_RUNS} runs total)"
+  echo "  1. fan d128 L1 seed 1"
+  echo "  2. fan d128 L1 seed 2"
+  echo "  3. basic L6 seed 1"
+  echo "  4. basic L10 seed 1"
+  echo "  5. basic L6 seed 2"
+  echo "  6. basic L10 seed 2"
+  echo "  7. fan d128 L2 seed 0"
+  echo "  8. fan d256 L2 seed 0"
+  echo "Device: ${DEVICE}"
+  echo "Python: ${PYTHON_BIN:-auto}"
+  echo "Train steps: ${TRAIN_STEPS}"
+  echo "Fixed loop counts: ${FIXED_LOOP_COUNTS[*]}"
+}
+
+start_experiment() {
+  local label="$1"
+  RUN_INDEX=$((RUN_INDEX + 1))
+  CURRENT_LABEL="${label}"
+  echo
+  echo "================================================================"
+  echo "[${RUN_INDEX}/${TOTAL_RUNS}] START ${label}"
+  echo "Completed: ${COMPLETED_RUNS}/${TOTAL_RUNS}; Remaining: $((TOTAL_RUNS - COMPLETED_RUNS))"
+  echo "================================================================"
+}
+
+finish_experiment() {
+  local label="$1"
+  COMPLETED_RUNS=$((COMPLETED_RUNS + 1))
+  echo
+  echo "[${COMPLETED_RUNS}/${TOTAL_RUNS}] DONE ${label}"
+  echo "Remaining: $((TOTAL_RUNS - COMPLETED_RUNS))"
+}
+
+log_stage() {
+  echo "  -> $1"
+}
+
 if [[ -z "${PYTHON_BIN}" ]]; then
   if [[ -x /venv/main/bin/python ]]; then
     PYTHON_BIN="/venv/main/bin/python"
@@ -42,6 +88,8 @@ if [[ ! -f "${BOUNDARY_DATA_DIR}/boundary_11_19.jsonl" ]]; then
   exit 1
 fi
 
+print_plan
+
 latest_run_dir() {
   local run_name="$1"
   local run_dir
@@ -56,6 +104,7 @@ latest_run_dir() {
 eval_fan_run() {
   local run_dir="$1"
 
+  log_stage "evaluating ID/OOD fixed-K sweep -> ${run_dir}/length_matched_k_sweep.json"
   "${PYTHON_BIN}" scripts/evaluate_length_matched_checkpoint.py \
     --checkpoint "${run_dir}/checkpoint.pt" \
     --swaps-per-loop 1 \
@@ -65,6 +114,7 @@ eval_fan_run() {
     --device "${DEVICE}" \
     --out "${run_dir}/length_matched_k_sweep.json"
 
+  log_stage "evaluating boundary 11-19 fixed-K sweep -> ${run_dir}/boundary_11_19_k_sweep.json"
   "${PYTHON_BIN}" scripts/evaluate_length_matched_checkpoint.py \
     --checkpoint "${run_dir}/checkpoint.pt" \
     --data-dir "${BOUNDARY_DATA_DIR}" \
@@ -83,7 +133,10 @@ run_fan() {
   local d_ff="$4"
   local num_layers="$5"
   local run_name="$6"
+  local label="fan ${run_name} seed=${seed} d=${d_model} h=${n_heads} ff=${d_ff} L=${num_layers} device=${DEVICE}"
 
+  start_experiment "${label}"
+  log_stage "training -> ${OUTPUT_DIR}/${run_name}__<timestamp>"
   "${PYTHON_BIN}" scripts/run_original_experiments.py \
     --architecture fan-recurrent \
     --position-encoding none \
@@ -111,14 +164,21 @@ run_fan() {
     --device "${DEVICE}" \
     --run-name "${run_name}"
 
-  eval_fan_run "$(latest_run_dir "${run_name}")"
+  local run_dir
+  run_dir="$(latest_run_dir "${run_name}")"
+  log_stage "latest run dir: ${run_dir}"
+  eval_fan_run "${run_dir}"
+  finish_experiment "${label}"
 }
 
 run_basic() {
   local seed="$1"
   local num_layers="$2"
   local run_name="basic-atomic-nope-causal-l${num_layers}-seed${seed}"
+  local label="basic ${run_name} seed=${seed} d=128 h=4 ff=512 L=${num_layers} device=${DEVICE}"
 
+  start_experiment "${label}"
+  log_stage "training -> ${OUTPUT_DIR}/${run_name}__<timestamp>"
   "${PYTHON_BIN}" scripts/run_original_experiments.py \
     --architecture direct \
     --position-encoding none \
@@ -145,6 +205,8 @@ run_basic() {
 
   local run_dir
   run_dir="$(latest_run_dir "${run_name}")"
+  log_stage "latest run dir: ${run_dir}"
+  log_stage "evaluating boundary 11-19 -> ${run_dir}/boundary_11_19.json"
   "${PYTHON_BIN}" scripts/evaluate_direct_checkpoint.py \
     --checkpoint "${run_dir}/checkpoint.pt" \
     --data-dir "${BOUNDARY_DATA_DIR}" \
@@ -152,6 +214,7 @@ run_basic() {
     --eval-batch-size "${EVAL_BATCH_SIZE}" \
     --device "${DEVICE}" \
     --out "${run_dir}/boundary_11_19.json"
+  finish_experiment "${label}"
 }
 
 for seed in 1 2; do
@@ -172,3 +235,6 @@ run_fan \
 run_fan \
   0 256 8 1024 2 \
   "fan-atomic-nope-scaleWD-d256-h8-ff1024-L2-curr2to10-seed0"
+
+echo
+echo "All queued experiments completed: ${COMPLETED_RUNS}/${TOTAL_RUNS}"
