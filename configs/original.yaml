@@ -42,7 +42,25 @@ training:
   learning_rate: 0.0003
   weight_decay: 0.01
   gradient_clip: 1.0
+  scheduler:
+    name: cosine
+    warmup_epochs: 0
+    min_lr: 0.0
   seeds: [0, 1, 2]
+
+validation:
+  ratio: 0.1
+
+checkpointing:
+  save_every: 5
+  resume: null
+  overwrite: false
+
+performance:
+  amp: true
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
 
 analysis:
   aggregate: scripts/aggregate_original_results.py

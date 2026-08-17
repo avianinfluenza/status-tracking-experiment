@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
+import shutil
 import time
+import types
+from contextlib import nullcontext
 from collections import defaultdict
 from datetime import datetime
 from functools import partial
@@ -40,6 +44,7 @@ from .model import (
     OriginalModelConfig,
     RecurrentR0Transformer,
     RecurrentTransformer,
+    SelfAttention,
     build_model,
     count_parameters,
 )
@@ -163,14 +168,24 @@ class SwapCountBatchSampler(Sampler[list[int]]):
         return sum((len(indices) + self.batch_size - 1) // self.batch_size for indices in self.buckets.values())
 
 
+def make_dataset(path: Path, architecture: str) -> Dataset:
+    if architecture == "cot":
+        return ExplicitCoTDataset(str(path))
+    return BallSwapDataset(path)
+
+
 def make_loader(
-    path: Path,
+    source: Path | Dataset,
     architecture: str,
     *,
     batch_size: int,
     shuffle: bool,
     seed: int,
     max_samples: int | None,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    persistent_workers: bool = False,
+    generator: torch.Generator | None = None,
     slot_first: bool = False,
     swaps_per_loop: float | None = None,
     input_format: str = "template",
@@ -178,10 +193,10 @@ def make_loader(
     if architecture == "cot":
         if slot_first:
             raise ValueError("--slot-first is supported for direct/recurrent classifiers, not cot")
-        dataset: Dataset = ExplicitCoTDataset(str(path))
+        dataset = ExplicitCoTDataset(str(source)) if isinstance(source, Path) else source
         collator = collate_cot
     else:
-        dataset = BallSwapDataset(path)
+        dataset = BallSwapDataset(source) if isinstance(source, Path) else source
         collator = partial(collate_fn, slot_first=slot_first, input_format=input_format)
     selected_dataset = _subset(dataset, max_samples)
     if swaps_per_loop is not None:
@@ -197,18 +212,223 @@ def make_loader(
                 seed=seed,
             ),
             collate_fn=collator,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers and num_workers > 0,
         )
     return DataLoader(
         selected_dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         collate_fn=collator,
-        generator=torch.Generator().manual_seed(seed),
+        generator=generator or torch.Generator().manual_seed(seed),
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=persistent_workers and num_workers > 0,
     )
 
 
+def split_train_validation(
+    dataset: Dataset,
+    *,
+    validation_ratio: float,
+    seed: int,
+    max_samples: int | None,
+) -> tuple[Dataset, Dataset]:
+    """Create a deterministic split stratified by the number of swaps."""
+
+    dataset = _subset(dataset, max_samples)
+    size = len(dataset)
+    if size < 2:
+        raise ValueError("at least two training samples are required for validation")
+    groups: dict[int, list[int]] = defaultdict(list)
+    for index in range(size):
+        row = dataset[index]  # type: ignore[index]
+        if not isinstance(row, dict) or "n_swaps" not in row:
+            raise ValueError("training rows must contain n_swaps for stratification")
+        groups[int(row["n_swaps"])].append(index)
+
+    train_indices: list[int] = []
+    validation_indices: list[int] = []
+    for n_swaps, indices in sorted(groups.items()):
+        shuffled = list(indices)
+        random.Random(seed * 1_000_003 + n_swaps).shuffle(shuffled)
+        if len(shuffled) == 1:
+            validation_size = 0
+        else:
+            validation_size = max(1, round(len(shuffled) * validation_ratio))
+            validation_size = min(validation_size, len(shuffled) - 1)
+        validation_indices.extend(shuffled[:validation_size])
+        train_indices.extend(shuffled[validation_size:])
+
+    if not validation_indices:
+        validation_indices.append(train_indices.pop())
+    return Subset(dataset, train_indices), Subset(dataset, validation_indices)
+
+
 def move_tensors(batch: dict[str, Tensor], device: torch.device) -> dict[str, Tensor]:
-    return {key: value.to(device) for key, value in batch.items()}
+    return {key: value.to(device, non_blocking=True) for key, value in batch.items()}
+
+
+def _forward_loss(
+    model: OriginalModel,
+    batch: dict[str, Tensor],
+    deep_supervision_weight: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    if isinstance(model, ExplicitCoTTransformer):
+        logits = model(batch["input_ids"], batch["attention_mask"])
+        targets = batch["lm_labels"]
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
+        return loss, logits, targets
+    if isinstance(model, EventWiseRecurrentTransformer):
+        targets = batch["labels"]
+        logits = model(
+            batch["initial_colors"],
+            batch["register_mask"],
+            batch["event_input_ids"],
+            batch["event_mask"],
+        )
+        loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
+        return loss, logits, targets
+    if _supports_loop_override(model) and deep_supervision_weight > 0.0:
+        loop_logits = model.forward_all_loops(
+            batch["input_ids"], batch["attn_mask"], batch["slot_pos"]
+        )
+        targets = batch["labels"]
+        logits = loop_logits[:, -1]
+        final_loss = F.cross_entropy(
+            logits.reshape(-1, logits.shape[-1]),
+            targets.reshape(-1),
+            ignore_index=-100,
+        )
+        if loop_logits.shape[1] > 1:
+            intermediate = loop_logits[:, :-1]
+            repeated_targets = targets[:, None].expand(-1, intermediate.shape[1], -1)
+            intermediate_loss = F.cross_entropy(
+                intermediate.reshape(-1, intermediate.shape[-1]),
+                repeated_targets.reshape(-1),
+                ignore_index=-100,
+            )
+            return final_loss + deep_supervision_weight * intermediate_loss, logits, targets
+        return final_loss, logits, targets
+    logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+    targets = batch["labels"]
+    loss = F.cross_entropy(
+        logits.reshape(-1, logits.shape[-1]),
+        targets.reshape(-1),
+        ignore_index=-100,
+    )
+    return loss, logits, targets
+
+
+def _autocast_context(device: torch.device, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=torch.float16)
+
+
+class InferenceComputeMeter:
+    """Runtime FLOP and wall-time meter for this repository's forward passes.
+
+    Counts multiply-add work in ``nn.Linear`` modules and the two attention
+    matrix multiplications (QK^T and AV) from their runtime tensor shapes.
+    It deliberately excludes embedding lookups, normalisation, masking,
+    softmax, activations, and elementwise residual operations.
+    """
+
+    method = "runtime linear projections + attention QK^T/AV; excludes embedding, norm, softmax, activation, masking, and elementwise ops"
+
+    def __init__(self, model: OriginalModel, device: torch.device) -> None:
+        self.model = model
+        self.device = device
+        self.linear_flops = 0
+        self.attention_flops = 0
+        self.inference_seconds = 0.0
+        self.forward_calls = 0
+        self._hooks: list[Any] = []
+        self._patched_attention: list[SelfAttention] = []
+
+    def __enter__(self) -> "InferenceComputeMeter":
+        for module in self.model.modules():
+            if isinstance(module, nn.Linear):
+                self._hooks.append(module.register_forward_hook(self._linear_hook))
+            if isinstance(module, SelfAttention):
+                self._hooks.append(module.register_forward_hook(self._attention_hook))
+                self._patch_incremental_attention(module)
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        for hook in self._hooks:
+            hook.remove()
+        self._hooks.clear()
+        for attention in self._patched_attention:
+            delattr(attention, "incremental")
+        self._patched_attention.clear()
+
+    def _linear_hook(self, module: nn.Module, inputs: tuple[object, ...], _output: object) -> None:
+        assert isinstance(module, nn.Linear)
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, Tensor):
+            raise TypeError("linear meter expected a Tensor input")
+        vectors = input_tensor.numel() // module.in_features
+        self.linear_flops += 2 * vectors * module.in_features * module.out_features
+
+    def _attention_hook(self, _module: nn.Module, inputs: tuple[object, ...], _output: object) -> None:
+        input_tensor = inputs[0]
+        if not isinstance(input_tensor, Tensor):
+            raise TypeError("attention meter expected a Tensor input")
+        batch, length, width = input_tensor.shape
+        # QK^T and AV each cost 2 * B * L * L * d_model FLOPs.
+        self.attention_flops += 4 * batch * length * length * width
+
+    def _patch_incremental_attention(self, attention: SelfAttention) -> None:
+        original = attention.incremental
+
+        def counted_incremental(
+            _module: SelfAttention,
+            x: Tensor,
+            position_ids: Tensor,
+            cache: tuple[Tensor, Tensor] | None,
+        ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+            batch, new_length, width = x.shape
+            key_length = new_length if cache is None else new_length + cache[0].shape[-2]
+            self.attention_flops += 4 * batch * new_length * key_length * width
+            return original(x, position_ids, cache)
+
+        attention.incremental = types.MethodType(counted_incremental, attention)
+        self._patched_attention.append(attention)
+
+    def measure(self, forward: Any) -> Any:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        started = time.perf_counter()
+        result = forward()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.inference_seconds += time.perf_counter() - started
+        self.forward_calls += 1
+        return result
+
+    def summary(self, n_samples: int) -> dict[str, object]:
+        flops = self.linear_flops + self.attention_flops
+        return {
+            "flops": flops,
+            "tflops": flops / 1e12,
+            "flops_per_sample": flops / max(n_samples, 1),
+            "inference_seconds": self.inference_seconds,
+            "milliseconds_per_sample": 1e3 * self.inference_seconds / max(n_samples, 1),
+            "samples_per_second": n_samples / max(self.inference_seconds, 1e-12),
+            "forward_calls": self.forward_calls,
+            "method": self.method,
+        }
 
 
 def _supports_loop_override(model: OriginalModel) -> bool:
@@ -433,6 +653,9 @@ def train_epoch(
     device: torch.device,
     grad_clip: float,
     deep_supervision_weight: float = 0.0,
+    *,
+    scaler: Any | None = None,
+    amp_enabled: bool = False,
     random_loop_range: tuple[int, int] | None = None,
     swaps_per_loop: float | None = None,
     scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
@@ -541,10 +764,18 @@ def train_epoch(
                     ignore_index=-100,
                 )
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            if grad_clip > 0:
-                clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            if scaler is not None and amp_enabled:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                if grad_clip > 0:
+                    clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                if grad_clip > 0:
+                    clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
             if scheduler is not None:
                 scheduler.step()
             count = int((targets != -100).sum().item())
@@ -573,6 +804,47 @@ def train_epoch(
             exact_match=exact_correct / max(sample_count, 1),
         )
     return weighted_loss / max(target_count, 1)
+
+
+@torch.inference_mode()
+def validate_epoch(
+    model: OriginalModel,
+    loader: DataLoader,
+    device: torch.device,
+    deep_supervision_weight: float = 0.0,
+    *,
+    amp_enabled: bool = False,
+) -> dict[str, float | int]:
+    """Compute teacher-forced validation metrics for checkpoint selection."""
+
+    model.eval()
+    weighted_loss = 0.0
+    target_count = 0
+    correct_count = 0
+    exact_correct = 0
+    sample_count = 0
+    for batch_cpu in loader:
+        batch = move_tensors(batch_cpu, device)
+        with _autocast_context(device, amp_enabled):
+            loss, logits, targets = _forward_loss(model, batch, deep_supervision_weight)
+        valid = targets != -100
+        predictions = logits.argmax(-1)
+        count = int(valid.sum().item())
+        weighted_loss += float(loss.item()) * count
+        target_count += count
+        correct_count += int(((predictions == targets) & valid).sum().item())
+        if targets.ndim == 2 and targets.shape[1] == 5:
+            exact_correct += int((((predictions == targets) | ~valid).all(dim=1)).sum().item())
+            sample_count += targets.shape[0]
+    metrics: dict[str, float | int] = {
+        "loss": weighted_loss / max(target_count, 1),
+        "token_accuracy": correct_count / max(target_count, 1),
+        "target_count": target_count,
+    }
+    if sample_count:
+        metrics["exact_match"] = exact_correct / sample_count
+        metrics["n_samples"] = sample_count
+    return metrics
 
 
 def _accumulate_metrics(
@@ -641,53 +913,63 @@ def evaluate_classifier(
     final_update_count = 0
     final_confidence_sum = 0.0
     final_confidence_count = 0
-    for batch_cpu in loader:
-        batch = move_tensors(batch_cpu, device)
-        if adaptive_kl:
-            if not _supports_loop_override(model):
-                raise ValueError("adaptive halting is available only for recurrent models")
-            logits, diagnostics = model.forward_adaptive(
-                batch["input_ids"],
-                batch["attn_mask"],
-                batch["slot_pos"],
-                max_loops=num_loops,
-            )
-            step_sum += int(diagnostics["steps_taken"].sum().item())
-            halt_sum += int(diagnostics["halted"].sum().item())
-            indices = (diagnostics["steps_taken"] - 1).unsqueeze(1)
-            final_kl = diagnostics["symmetric_kl"].gather(1, indices).squeeze(1)
-            finite = torch.isfinite(final_kl)
-            final_kl_sum += float(final_kl[finite].sum().item())
-            final_kl_count += int(finite.sum().item())
-            if "update_ratio" in diagnostics:
-                final_update = diagnostics["update_ratio"].gather(1, indices).squeeze(1)
-                finite_update = torch.isfinite(final_update)
-                final_update_sum += float(final_update[finite_update].sum().item())
-                final_update_count += int(finite_update.sum().item())
-            if "confidence" in diagnostics:
-                final_confidence = diagnostics["confidence"].gather(1, indices).squeeze(1)
-                finite_confidence = torch.isfinite(final_confidence)
-                final_confidence_sum += float(final_confidence[finite_confidence].sum().item())
-                final_confidence_count += int(finite_confidence.sum().item())
-        else:
-            if isinstance(model, EventWiseRecurrentTransformer):
-                logits = model(
-                    batch["initial_colors"],
-                    batch["register_mask"],
-                    batch["event_input_ids"],
-                    batch["event_mask"],
+    with InferenceComputeMeter(model, device) as meter:
+        for batch_cpu in loader:
+            batch = move_tensors(batch_cpu, device)
+            if adaptive_kl:
+                if not _supports_loop_override(model):
+                    raise ValueError("adaptive halting is available only for recurrent models")
+                logits, diagnostics = meter.measure(
+                    lambda: model.forward_adaptive(
+                        batch["input_ids"],
+                        batch["attn_mask"],
+                        batch["slot_pos"],
+                        max_loops=num_loops,
+                    )
                 )
-            elif num_loops is not None:
-                logits = model(
-                    batch["input_ids"],
-                    batch["attn_mask"],
-                    batch["slot_pos"],
-                    num_loops=num_loops,
-                )
+                step_sum += int(diagnostics["steps_taken"].sum().item())
+                halt_sum += int(diagnostics["halted"].sum().item())
+                indices = (diagnostics["steps_taken"] - 1).unsqueeze(1)
+                final_kl = diagnostics["symmetric_kl"].gather(1, indices).squeeze(1)
+                finite = torch.isfinite(final_kl)
+                final_kl_sum += float(final_kl[finite].sum().item())
+                final_kl_count += int(finite.sum().item())
+                if "update_ratio" in diagnostics:
+                    final_update = diagnostics["update_ratio"].gather(1, indices).squeeze(1)
+                    finite_update = torch.isfinite(final_update)
+                    final_update_sum += float(final_update[finite_update].sum().item())
+                    final_update_count += int(finite_update.sum().item())
+                if "confidence" in diagnostics:
+                    final_confidence = diagnostics["confidence"].gather(1, indices).squeeze(1)
+                    finite_confidence = torch.isfinite(final_confidence)
+                    final_confidence_sum += float(final_confidence[finite_confidence].sum().item())
+                    final_confidence_count += int(finite_confidence.sum().item())
             else:
-                logits = model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
-        _accumulate_metrics(logits.argmax(-1), batch["labels"], batch["n_swaps"], totals)
+                if isinstance(model, EventWiseRecurrentTransformer):
+                    logits = meter.measure(
+                        lambda: model(
+                            batch["initial_colors"],
+                            batch["register_mask"],
+                            batch["event_input_ids"],
+                            batch["event_mask"],
+                        )
+                    )
+                elif num_loops is not None:
+                    logits = meter.measure(
+                        lambda: model(
+                            batch["input_ids"],
+                            batch["attn_mask"],
+                            batch["slot_pos"],
+                            num_loops=num_loops,
+                        )
+                    )
+                else:
+                    logits = meter.measure(
+                        lambda: model(batch["input_ids"], batch["attn_mask"], batch["slot_pos"])
+                    )
+            _accumulate_metrics(logits.argmax(-1), batch["labels"], batch["n_swaps"], totals)
     metrics = _finish_metrics(totals)
+    metrics["inference_compute"] = meter.summary(int(metrics["n_samples"]))
     if num_loops is not None:
         metrics["num_loops"] = num_loops
     if adaptive_kl:
@@ -981,28 +1263,83 @@ def evaluate_cot(
     model.eval()
     totals = _empty_totals()
     groups = group_rows_by_swap_count(_rows_from_dataset(dataset))
-    for n_swaps, rows in sorted(groups.items()):
-        for start in range(0, len(rows), generation_batch_size):
-            chunk = rows[start : start + generation_batch_size]
-            predictions = model.generate_states(chunk).cpu()
-            labels = torch.tensor([row["labels"] for row in chunk], dtype=torch.long)
-            lengths = torch.full((len(chunk),), n_swaps, dtype=torch.long)
-            _accumulate_metrics(predictions, labels, lengths, totals)
+    device = model.embedding.weight.device
+    with InferenceComputeMeter(model, device) as meter:
+        for n_swaps, rows in sorted(groups.items()):
+            for start in range(0, len(rows), generation_batch_size):
+                chunk = rows[start : start + generation_batch_size]
+                predictions = meter.measure(lambda: model.generate_states(chunk)).cpu()
+                labels = torch.tensor([row["labels"] for row in chunk], dtype=torch.long)
+                lengths = torch.full((len(chunk),), n_swaps, dtype=torch.long)
+                _accumulate_metrics(predictions, labels, lengths, totals)
     metrics = _finish_metrics(totals)
     metrics["evaluation_mode"] = "autoregressive_trace_generation"
+    metrics["inference_compute"] = meter.summary(int(metrics["n_samples"]))
     return metrics
 
 
-def save_checkpoint(path: Path, model: OriginalModel, epoch: int) -> None:
+def _atomic_torch_save(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "config": model.config.to_dict(),
-            "model_state": model.state_dict(),
-            "epoch": epoch,
-        },
-        path,
-    )
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
+
+
+def _rng_state() -> dict[str, object]:
+    state: dict[str, object] = {
+        "python": random.getstate(),
+        "torch": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: dict[str, object]) -> None:
+    random.setstate(state["python"])  # type: ignore[arg-type]
+    torch.set_rng_state(state["torch"])  # type: ignore[arg-type]
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])  # type: ignore[arg-type]
+
+
+def save_training_checkpoint(
+    path: Path,
+    *,
+    model: OriginalModel,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any | None,
+    scaler: Any | None,
+    epoch: int,
+    history: list[dict[str, object]],
+    best_validation_loss: float,
+    best_epoch: int,
+    training_seconds: float,
+    run_config: dict[str, object],
+) -> dict[str, object]:
+    state: dict[str, object] = {
+        "format_version": 2,
+        "config": model.config.to_dict(),
+        "run_config": run_config,
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+        "scaler_state": scaler.state_dict() if scaler is not None else None,
+        "epoch": epoch,
+        "history": history,
+        "best_validation_loss": best_validation_loss,
+        "best_epoch": best_epoch,
+        "training_seconds": training_seconds,
+        "rng_state": _rng_state(),
+    }
+    _atomic_torch_save(path, state)
+    return state
+
+
+def load_training_checkpoint(path: Path, device: torch.device) -> dict[str, object]:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:  # PyTorch 2.2 compatibility
+        return torch.load(path, map_location=device)
 
 
 def write_json(path: Path, payload: dict[str, object]) -> None:
@@ -1011,6 +1348,27 @@ def write_json(path: Path, payload: dict[str, object]) -> None:
         json.dumps(_json_ready(payload), ensure_ascii=False, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+
+
+def append_jsonl(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def rewrite_metrics_log(path: Path, history: Sequence[dict[str, object]]) -> None:
+    """Atomically make the durable epoch log match checkpoint history."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        for record in history:
+            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1139,9 +1497,36 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--eval-batch-size", type=int, default=128)
+    parser.add_argument("--validation-ratio", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--optimizer", choices=("adamw", "adam", "sgd"), default="adamw")
+    parser.add_argument("--scheduler", choices=("none", "cosine", "linear"), default="cosine")
+    parser.add_argument("--warmup-epochs", type=int, default=0)
+    parser.add_argument("--min-lr", type=float, default=0.0)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--pin-memory", action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--checkpoint-every", type=int, default=5)
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="checkpoint path, or 'auto' to use this run's checkpoints/last.pt",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="delete an existing run with the same name before starting",
+    )
+    parser.add_argument("--eval-splits", nargs="+", choices=EVAL_SPLITS, default=list(EVAL_SPLITS))
+    parser.add_argument(
+        "--eval-metrics",
+        nargs="+",
+        choices=("slot_accuracy", "exact_match", "exact_match_by_swaps"),
+        default=["slot_accuracy", "exact_match", "exact_match_by_swaps"],
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data")
@@ -1169,6 +1554,84 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser.parse_args(argv)
+
+
+def _build_optimizer(args: argparse.Namespace, model: OriginalModel) -> torch.optim.Optimizer:
+    common = {"lr": args.lr, "weight_decay": args.weight_decay}
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(model.parameters(), **common)
+    if args.optimizer == "adam":
+        return torch.optim.Adam(model.parameters(), **common)
+    return torch.optim.SGD(model.parameters(), momentum=0.9, **common)
+
+
+def _build_scheduler(
+    args: argparse.Namespace, optimizer: torch.optim.Optimizer
+) -> Any | None:
+    if args.scheduler == "none":
+        return None
+    if args.scheduler == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(args.epochs, 1), eta_min=args.min_lr
+        )
+
+    def linear_multiplier(completed_epochs: int) -> float:
+        if args.warmup_epochs > 0 and completed_epochs < args.warmup_epochs:
+            return (completed_epochs + 1) / args.warmup_epochs
+        decay_epochs = max(args.epochs - args.warmup_epochs, 1)
+        progress = (completed_epochs - args.warmup_epochs + 1) / decay_epochs
+        minimum = args.min_lr / args.lr if args.lr > 0 else 0.0
+        return max(minimum, 1.0 - progress * (1.0 - minimum))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, linear_multiplier)
+
+
+def _make_grad_scaler(enabled: bool) -> Any | None:
+    if not enabled:
+        return None
+    try:
+        return torch.amp.GradScaler("cuda", enabled=True)
+    except (AttributeError, TypeError):  # PyTorch 2.2 fallback
+        return torch.cuda.amp.GradScaler(enabled=True)
+
+
+def _default_run_name(args: argparse.Namespace) -> str:
+    return build_run_name(args)
+
+
+def _validate_run_name(run_name: str) -> None:
+    if not run_name or Path(run_name).name != run_name or run_name in {".", ".."}:
+        raise ValueError("run name must be a single non-empty path component")
+
+
+def _prepare_run_outputs(
+    args: argparse.Namespace, run_name: str
+) -> tuple[Path, Path, Path, Path]:
+    """Reject accidental collisions or explicitly clear one exact run."""
+
+    _validate_run_name(run_name)
+    output_dir = args.output_dir.resolve()
+    run_dir = output_dir / run_name
+    result_json = output_dir / f"{run_name}.json"
+    result_checkpoint = output_dir / f"{run_name}.pt"
+    if args.resume and args.overwrite:
+        raise ValueError("--resume and --overwrite cannot be used together")
+    existing = [path for path in (run_dir, result_json, result_checkpoint) if path.exists()]
+    if args.resume is None and existing and not args.overwrite:
+        paths = ", ".join(str(path) for path in existing)
+        raise FileExistsError(
+            f"run '{run_name}' already exists ({paths}); use --resume or --overwrite"
+        )
+    if args.overwrite:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if run_dir.parent.resolve() != output_dir or run_dir == output_dir:
+            raise ValueError("refusing to overwrite a run outside output-dir")
+        if run_dir.exists():
+            shutil.rmtree(run_dir)
+        for path in (result_json, result_checkpoint):
+            if path.exists():
+                path.unlink()
+    return run_dir, run_dir / "checkpoints", run_dir / "metrics.jsonl", result_json
 
 
 def run(args: argparse.Namespace) -> dict[str, object]:
@@ -1212,6 +1675,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         raise ValueError("--eval-loop-counts requires a recurrent architecture")
     if args.noop_eval_ratio < 0.0:
         raise ValueError("--noop-eval-ratio must be non-negative")
+    if not 0.0 < args.validation_ratio < 1.0:
+        raise ValueError("--validation-ratio must be between zero and one")
+    if args.checkpoint_every < 0:
+        raise ValueError("--checkpoint-every must be non-negative")
+    if args.num_workers < 0:
+        raise ValueError("--num-workers must be non-negative")
+    if args.persistent_workers and args.num_workers == 0:
+        raise ValueError("--persistent-workers requires --num-workers greater than zero")
     if args.online_training and args.architecture not in {"fan-recurrent", "direct"}:
         raise ValueError("--online-training requires fan-recurrent or direct")
     if args.architecture != "fan-recurrent" and (
@@ -1297,8 +1768,14 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             + ". Generate them with `python -m src.data.data --extended-length --out data/extended_length`."
         )
     device = resolve_device(args.device)
+    amp_enabled = bool(args.amp and device.type == "cuda")
+    pin_memory = device.type == "cuda" if args.pin_memory is None else args.pin_memory
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
+    run_name = _default_run_name(args)
+    run_dir, checkpoint_dir, metrics_path, result_json_path = _prepare_run_outputs(
+        args, run_name
+    )
     config = OriginalModelConfig(
         architecture=args.architecture,
         position_encoding=args.position_encoding,
@@ -1323,12 +1800,8 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         direct_input_format=args.direct_input_format,
         direct_causal=args.direct_causal,
     )
-    run_name = build_run_name(args)
-    run_dir = create_unique_run_dir(
-        args.output_dir,
-        run_name,
-        timestamp=timestamp_label(run_started_at),
-    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     config_path = run_dir / "config.json"
     args_path = run_dir / "args.json"
     result_path = run_dir / "result.json"
@@ -1337,11 +1810,26 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     write_json(args_path, vars(args))
 
     model = maybe_compile_model(build_model(config).to(device), device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    started = time.perf_counter()
+    optimizer = _build_optimizer(args, model)
+    scheduler: Any | None = None
+    scaler = _make_grad_scaler(amp_enabled)
+    run_config: dict[str, object] = {
+        key: str(value) if isinstance(value, Path) else value
+        for key, value in vars(args).items()
+    }
+    history: list[dict[str, object]] = []
     losses: list[float] = []
+    best_validation_loss = float("inf")
+    best_epoch = 0
+    previous_training_seconds = 0.0
+    train_dataset: Dataset | None = None
+    validation_dataset: Dataset | None = None
+    train_loader: Iterable[dict[str, Tensor]] | None = None
     show_progress = not args.no_progress
+    started = time.perf_counter()
     if args.online_training:
+        if args.resume is not None:
+            raise ValueError("online training resume is not supported in this merged path")
         train_stream = DeterministicOnlineBatchStream(
             num_steps=args.train_steps,
             batch_size=args.batch_size,
@@ -1356,6 +1844,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 else args.direct_input_format
             ),
         )
+        train_loader = train_stream
         curriculum_steps = (
             args.curriculum_max_swaps - args.curriculum_min_swaps
         ) * args.curriculum_steps_per_length
@@ -1382,26 +1871,108 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 metrics=train_metrics,
             )
         )
+        training_seconds = time.perf_counter() - started
+        history.append({
+            "epoch": args.train_steps,
+            "train_loss": losses[-1],
+            "training": train_metrics,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "epoch_seconds": training_seconds,
+        })
+        best_epoch = args.train_steps
+        best_validation_loss = float("nan")
+        best_state = save_training_checkpoint(
+            checkpoint_dir / "last.pt",
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            epoch=args.train_steps,
+            history=history,
+            best_validation_loss=best_validation_loss,
+            best_epoch=best_epoch,
+            training_seconds=training_seconds,
+            run_config=run_config,
+        )
+        _atomic_torch_save(checkpoint_dir / "best.pt", best_state)
+        append_jsonl(metrics_path, history[-1])
     else:
+        full_train_dataset = make_dataset(args.data_dir / "train.jsonl", args.architecture)
+        train_dataset, validation_dataset = split_train_validation(
+            full_train_dataset,
+            validation_ratio=args.validation_ratio,
+            seed=args.seed,
+            max_samples=args.max_train_samples,
+        )
+        validation_loader = make_loader(
+            validation_dataset,
+            args.architecture,
+            batch_size=args.eval_batch_size,
+            shuffle=False,
+            seed=args.seed,
+            max_samples=None,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=args.persistent_workers,
+            slot_first=args.slot_first,
+            input_format=args.direct_input_format if args.architecture == "direct" else "template",
+        )
+        train_generator = torch.Generator()
         train_loader = make_loader(
-            args.data_dir / "train.jsonl",
+            train_dataset,
             args.architecture,
             batch_size=args.batch_size,
             shuffle=True,
             seed=args.seed,
-            max_samples=args.max_train_samples,
+            max_samples=None,
+            num_workers=args.num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=args.persistent_workers,
+            generator=train_generator,
             slot_first=args.slot_first,
             swaps_per_loop=args.swaps_per_loop,
             input_format=(
                 args.direct_input_format if args.architecture == "direct" else "template"
             ),
         )
-        epoch_iterable: Iterable[int] = range(1, args.epochs + 1)
+        scheduler = _build_scheduler(args, optimizer)
+        start_epoch = 1
+        resume_path: Path | None = None
+        if args.resume == "auto":
+            resume_path = checkpoint_dir / "last.pt"
+        elif args.resume:
+            resume_path = Path(args.resume)
+        if resume_path is not None:
+            if not resume_path.exists():
+                raise FileNotFoundError(f"resume checkpoint not found: {resume_path}")
+            state = load_training_checkpoint(resume_path, device)
+            checkpoint_config = state.get("config")
+            if checkpoint_config != config.to_dict():
+                raise ValueError("resume checkpoint model config does not match this run")
+            model.load_state_dict(state["model_state"])  # type: ignore[arg-type]
+            optimizer.load_state_dict(state["optimizer_state"])  # type: ignore[arg-type]
+            if scheduler is not None and state.get("scheduler_state") is not None:
+                scheduler.load_state_dict(state["scheduler_state"])  # type: ignore[arg-type]
+            if scaler is not None and state.get("scaler_state") is not None:
+                scaler.load_state_dict(state["scaler_state"])  # type: ignore[arg-type]
+            history = list(state.get("history", []))  # type: ignore[arg-type]
+            losses = [float(record["train_loss"]) for record in history if "train_loss" in record]
+            best_validation_loss = float(state.get("best_validation_loss", float("inf")))
+            best_epoch = int(state.get("best_epoch", 0))
+            previous_training_seconds = float(state.get("training_seconds", 0.0))
+            start_epoch = int(state["epoch"]) + 1
+            if "rng_state" in state:
+                _restore_rng_state(state["rng_state"])  # type: ignore[arg-type]
+            rewrite_metrics_log(metrics_path, history)
+        else:
+            rewrite_metrics_log(metrics_path, [])
+
+        epoch_iterable: Iterable[int] = range(start_epoch, args.epochs + 1)
         epoch_progress = None
         if show_progress:
             epoch_progress = _progress_bar(
                 epoch_iterable,
-                total=args.epochs,
+                total=max(args.epochs - start_epoch + 1, 0),
                 desc=f"{args.architecture} seed{args.seed}",
                 leave=True,
                 position=0,
@@ -1409,6 +1980,10 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             epoch_iterable = epoch_progress
         try:
             for epoch in epoch_iterable:
+                train_generator.manual_seed(args.seed + epoch)
+                if isinstance(getattr(train_loader, "batch_sampler", None), SwapCountBatchSampler):
+                    train_loader.batch_sampler.epoch = epoch  # type: ignore[union-attr]
+                epoch_started = time.perf_counter()
                 train_metrics = {}
                 loss = train_epoch(
                     model,
@@ -1419,11 +1994,55 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                     deep_supervision_weight=args.deep_supervision_weight,
                     random_loop_range=(random_min, random_max) if args.random_loops else None,
                     swaps_per_loop=args.swaps_per_loop,
+                    scaler=scaler,
+                    amp_enabled=amp_enabled,
                     epoch=epoch,
                     show_progress=show_progress,
                     metrics=train_metrics,
                 )
                 losses.append(loss)
+                validation = validate_epoch(
+                    model,
+                    validation_loader,
+                    device,
+                    deep_supervision_weight=args.deep_supervision_weight,
+                    amp_enabled=amp_enabled,
+                )
+                learning_rate = optimizer.param_groups[0]["lr"]
+                if scheduler is not None:
+                    scheduler.step()
+                epoch_record: dict[str, object] = {
+                    "epoch": epoch,
+                    "train_loss": loss,
+                    "train_metrics": train_metrics,
+                    "validation": validation,
+                    "learning_rate": learning_rate,
+                    "epoch_seconds": time.perf_counter() - epoch_started,
+                }
+                history.append(epoch_record)
+                improved = float(validation["loss"]) < best_validation_loss
+                if improved:
+                    best_validation_loss = float(validation["loss"])
+                    best_epoch = epoch
+                elapsed = previous_training_seconds + time.perf_counter() - started
+                state = save_training_checkpoint(
+                    checkpoint_dir / "last.pt",
+                    model=model,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    scaler=scaler,
+                    epoch=epoch,
+                    history=history,
+                    best_validation_loss=best_validation_loss,
+                    best_epoch=best_epoch,
+                    training_seconds=elapsed,
+                    run_config=run_config,
+                )
+                if improved:
+                    _atomic_torch_save(checkpoint_dir / "best.pt", state)
+                if args.checkpoint_every and epoch % args.checkpoint_every == 0:
+                    _atomic_torch_save(checkpoint_dir / f"epoch_{epoch}.pt", state)
+                append_jsonl(metrics_path, epoch_record)
                 if epoch_progress is not None:
                     epoch_progress.set_postfix(
                         loss=f"{loss:.4f}",
@@ -1433,10 +2052,15 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         finally:
             if epoch_progress is not None:
                 epoch_progress.close()
-    training_seconds = time.perf_counter() - started
+        training_seconds = previous_training_seconds + time.perf_counter() - started
+        best_path = checkpoint_dir / "best.pt"
+        if not best_path.exists():
+            raise RuntimeError("no best checkpoint is available for final evaluation")
+        best_state = load_training_checkpoint(best_path, device)
+        model.load_state_dict(best_state["model_state"])  # type: ignore[arg-type]
 
     split_metrics: dict[str, object] = {}
-    for split in EVAL_SPLITS:
+    for split in args.eval_splits:
         path = args.data_dir / f"{split}.jsonl"
         if isinstance(model, ExplicitCoTTransformer):
             dataset = _subset(ExplicitCoTDataset(str(path)), args.max_eval_samples)
@@ -1449,6 +2073,9 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 shuffle=False,
                 seed=args.seed,
                 max_samples=args.max_eval_samples,
+                num_workers=args.num_workers,
+                pin_memory=pin_memory,
+                persistent_workers=args.persistent_workers,
                 slot_first=args.slot_first,
                 input_format=(
                     args.fan_input_format
@@ -1636,6 +2263,13 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         and args.position_encoding == "none"
         else "original_team_plan"
     )
+    train_sample_count = len(train_dataset) if train_dataset is not None else None
+    validation_sample_count = len(validation_dataset) if validation_dataset is not None else None
+    optimizer_steps = (
+        args.train_steps
+        if args.online_training
+        else len(history) * len(train_loader) if train_loader is not None else 0
+    )
     result = {
         "track": fan_track,
         "run_name": run_name,
@@ -1647,8 +2281,29 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         "config": config.to_dict(),
         "parameters": count_parameters(model),
         "seed": args.seed,
-        "training_loss": losses,
+        "training_loss": [record["train_loss"] for record in history],
+        "training_history": history,
         "training_seconds": training_seconds,
+        "validation": {
+            "ratio": args.validation_ratio,
+            "train_samples": train_sample_count,
+            "validation_samples": validation_sample_count,
+            "best_epoch": best_epoch,
+            "best_loss": best_validation_loss,
+        },
+        "training": {
+            "optimizer": args.optimizer,
+            "scheduler": args.scheduler,
+            "amp_requested": args.amp,
+            "amp_enabled": amp_enabled,
+            "num_workers": args.num_workers,
+            "pin_memory": pin_memory,
+        },
+        "evaluation": {
+            "splits": list(args.eval_splits),
+            "metrics": list(args.eval_metrics),
+            "checkpoint": "best.pt",
+        },
         "ablations": {
             "deep_supervision_weight": args.deep_supervision_weight,
             "trajectory_probe_eval": args.trajectory_probe_eval,
@@ -1679,7 +2334,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
                 else "final_ce_only"
             ),
             "online_training": args.online_training,
-            "optimizer_steps": args.train_steps if args.online_training else len(losses) * len(train_loader),
+            "optimizer_steps": optimizer_steps,
             "curriculum_min_swaps": args.curriculum_min_swaps if args.online_training else None,
             "curriculum_max_swaps": args.curriculum_max_swaps if args.online_training else None,
             "curriculum_steps_per_length": (
@@ -1695,16 +2350,16 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "config": str(config_path),
             "args": str(args_path),
             "result": str(result_path),
+            "legacy_result": str(result_json_path),
             "checkpoint": str(checkpoint_path),
+            "legacy_checkpoint": str(args.output_dir / f"{run_name}.pt"),
         },
         "splits": split_metrics,
     }
-    save_checkpoint(
-        checkpoint_path,
-        model,
-        args.train_steps if args.online_training else args.epochs,
-    )
+    _atomic_torch_save(args.output_dir / f"{run_name}.pt", best_state)
+    _atomic_torch_save(checkpoint_path, best_state)
     write_json(result_path, result)
+    write_json(result_json_path, result)
     return result
 
 

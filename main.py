@@ -70,13 +70,26 @@ def main() -> None:
         return
     args = parse_config_args()
     result = run_from_config(override_config(load_yaml(args.config), args))
-    compact = {
-        split: {
-            "exact_match": metrics["exact_match"],
-            "slot_accuracy": metrics["slot_accuracy"],
+    runs = result.get("runs")
+    if isinstance(runs, list):
+        compact = {
+            str(run["run_name"]): {
+                split: {
+                    "exact_match": metrics["exact_match"],
+                    "slot_accuracy": metrics["slot_accuracy"],
+                }
+                for split, metrics in run["splits"].items()
+            }
+            for run in runs
         }
-        for split, metrics in result["splits"].items()
-    }
+    else:
+        compact = {
+            split: {
+                "exact_match": metrics["exact_match"],
+                "slot_accuracy": metrics["slot_accuracy"],
+            }
+            for split, metrics in result["splits"].items()
+        }
     print(json.dumps(compact, ensure_ascii=False, indent=2))
 
 

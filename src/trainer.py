@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any
 
 from .original.experiment import parse_args as parse_run_args
@@ -18,6 +19,10 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
 
     model = dict(config.get("model") or {})
     training = dict(config.get("training") or config.get("train") or {})
+    evaluation = dict(config.get("evaluation") or {})
+    validation = dict(config.get("validation") or {})
+    checkpointing = dict(config.get("checkpointing") or {})
+    performance = dict(config.get("performance") or {})
     halting = dict(config.get("adaptive_halting") or {})
     ablations = dict(config.get("ablations") or {})
     architecture = config.get("architecture") or model.get("architecture") or model.get("name")
@@ -80,9 +85,21 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
         training.get("curriculum_steps_per_length"),
     )
     _append(arguments, "--batch-size", training.get("batch_size"))
+    _append(arguments, "--eval-batch-size", evaluation.get("batch_size"))
+    _append(arguments, "--validation-ratio", validation.get("ratio"))
     _append(arguments, "--lr", training.get("learning_rate"))
     _append(arguments, "--weight-decay", training.get("weight_decay"))
     _append(arguments, "--grad-clip", training.get("gradient_clip"))
+    optimizer = training.get("optimizer")
+    if isinstance(optimizer, dict):
+        optimizer = optimizer.get("name")
+    _append(arguments, "--optimizer", str(optimizer).lower() if optimizer else None)
+    scheduler = training.get("scheduler")
+    if isinstance(scheduler, dict):
+        _append(arguments, "--warmup-epochs", scheduler.get("warmup_epochs"))
+        _append(arguments, "--min-lr", scheduler.get("min_lr"))
+        scheduler = scheduler.get("name")
+    _append(arguments, "--scheduler", str(scheduler).lower() if scheduler else None)
     seed = training.get("seed")
     if seed is None:
         seeds = training.get("seeds")
@@ -92,6 +109,20 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
     _append(arguments, "--device", config.get("device"))
     _append(arguments, "--data-dir", config.get("data_dir"))
     _append(arguments, "--output-dir", config.get("output_dir"))
+    _append(arguments, "--run-name", config.get("run_name"))
+    _append(arguments, "--num-workers", performance.get("num_workers"))
+    _append(arguments, "--checkpoint-every", checkpointing.get("save_every"))
+    _append(arguments, "--resume", checkpointing.get("resume"))
+    if checkpointing.get("overwrite"):
+        arguments.append("--overwrite")
+    splits = evaluation.get("splits")
+    if splits:
+        arguments.append("--eval-splits")
+        arguments.extend(map(str, splits))
+    metrics = evaluation.get("metrics")
+    if metrics:
+        arguments.append("--eval-metrics")
+        arguments.extend(map(str, metrics))
     _append(arguments, "--kl-threshold", halting.get("threshold"))
     _append(arguments, "--adaptive-update-threshold", halting.get("update_threshold"))
     _append(arguments, "--adaptive-min-confidence", halting.get("min_confidence"))
@@ -121,6 +152,14 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
     if architecture in ("recurrent", "recurrent-r0") and halting.get("enabled_at_evaluation"):
         arguments.append("--adaptive-kl-eval")
         _append(arguments, "--adaptive-max-loops", halting.get("max_loops"))
+    if performance.get("amp", training.get("amp", False)):
+        arguments.append("--amp")
+    if performance.get("pin_memory") is True:
+        arguments.append("--pin-memory")
+    elif performance.get("pin_memory") is False:
+        arguments.append("--no-pin-memory")
+    if performance.get("persistent_workers"):
+        arguments.append("--persistent-workers")
     if config.get("progress") is False:
         arguments.append("--no-progress")
     if config.get("slot_first", (config.get("model") or {}).get("slot_first", False)):
@@ -133,7 +172,31 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
 
 
 def run_from_config(config: dict[str, Any]) -> dict[str, object]:
-    return run(parse_run_args(config_to_argv(config)))
+    """Run one seed, or every seed listed in ``training.seeds``."""
+
+    training = dict(config.get("training") or config.get("train") or {})
+    explicit_seed = training.get("seed")
+    seeds = [explicit_seed] if explicit_seed is not None else training.get("seeds", [0])
+    if not isinstance(seeds, list) or not seeds:
+        raise ValueError("training.seeds must be a non-empty list")
+    results: list[dict[str, object]] = []
+    for seed in seeds:
+        seeded = copy.deepcopy(config)
+        seeded_training = dict(seeded.get("training") or seeded.get("train") or {})
+        seeded_training["seed"] = int(seed)
+        seeded_training.pop("seeds", None)
+        seeded["training"] = seeded_training
+        seeded.pop("train", None)
+        if len(seeds) > 1 and config.get("run_name"):
+            seeded["run_name"] = f"{config['run_name']}-seed{int(seed)}"
+        results.append(run(parse_run_args(config_to_argv(seeded))))
+    if len(results) == 1:
+        return results[0]
+    return {
+        "track": "original_team_plan_multiseed_config",
+        "seeds": [int(seed) for seed in seeds],
+        "runs": results,
+    }
 
 
 __all__ = ["config_to_argv", "run_from_config"]
