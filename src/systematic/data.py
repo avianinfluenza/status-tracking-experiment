@@ -10,7 +10,7 @@ import random
 import re
 import hashlib
 from dataclasses import dataclass
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import torch
 from torch import Tensor
@@ -23,6 +23,7 @@ OOD_OBJECTS = ("token", "orb", "volume", "medallion", "band", "chart", "vessel",
 OOD_LOCATIONS = tuple(f"zone_{chr(ord('A') + index)}" for index in range(16))
 ACTORS = ("John", "Mary", "David", "Alice", "Jin", "Sara")
 GENERATOR_VERSION = "systematic-v2"
+ATOMIC_SERIALIZATION_VERSION = "systematic-atomic-v1"
 
 INITIAL_TEMPLATES = (
     "The {entity} is in {location}.",
@@ -318,12 +319,117 @@ class TokenVocabulary:
     def encode(self, text: str) -> list[int]:
         return [self.cls_id] + [self.stoi.get(token, self.stoi[self.UNK]) for token in tokenize(text)]
 
+    def encode_example(self, example: StateTrackingExample) -> list[int]:
+        return self.encode(example.text)
+
     def __len__(self) -> int:
         return len(self.itos)
 
 
+class AtomicVocabulary:
+    """One token per symbolic assignment, transition, and query.
+
+    Entity and location indices come directly from ``StateTrackingExample``;
+    rendered names and templates never enter this representation.
+    """
+
+    PAD = "[PAD]"
+
+    def __init__(self, *, num_entities: int, num_locations: int) -> None:
+        if num_entities < 2 or num_locations < 2:
+            raise ValueError("atomic vocabulary requires at least two entities and locations")
+        self.num_entities = num_entities
+        self.num_locations = num_locations
+        self._init_offset = 1
+        self._move_offset = self._init_offset + num_entities * num_locations
+        self._query_offset = (
+            self._move_offset + num_entities * num_locations * num_locations
+        )
+        tokens = [self.PAD]
+        tokens.extend(
+            f"[INIT_{entity}_{location}]"
+            for entity in range(num_entities)
+            for location in range(num_locations)
+        )
+        tokens.extend(
+            f"[MOVE_{entity}_{src}_{dst}]"
+            for entity in range(num_entities)
+            for src in range(num_locations)
+            for dst in range(num_locations)
+        )
+        tokens.extend(f"[QUERY_{entity}]" for entity in range(num_entities))
+        self.itos = tuple(tokens)
+        self.stoi = {token: index for index, token in enumerate(self.itos)}
+
+    @property
+    def pad_id(self) -> int:
+        return 0
+
+    def _validate_entity(self, entity: int) -> None:
+        if not 0 <= entity < self.num_entities:
+            raise ValueError("atomic example contains an out-of-range entity")
+
+    def _validate_location(self, location: int) -> None:
+        if not 0 <= location < self.num_locations:
+            raise ValueError("atomic example contains an out-of-range location")
+
+    def init_token(self, entity: int, location: int) -> int:
+        self._validate_entity(entity)
+        self._validate_location(location)
+        return self._init_offset + entity * self.num_locations + location
+
+    def move_token(self, entity: int, src: int, dst: int) -> int:
+        self._validate_entity(entity)
+        self._validate_location(src)
+        self._validate_location(dst)
+        return (
+            self._move_offset
+            + entity * self.num_locations * self.num_locations
+            + src * self.num_locations
+            + dst
+        )
+
+    def query_token(self, entity: int) -> int:
+        self._validate_entity(entity)
+        return self._query_offset + entity
+
+    def encode_example(self, example: StateTrackingExample) -> list[int]:
+        if example.num_entities > self.num_entities:
+            raise ValueError("atomic vocabulary does not cover all example entities")
+        tokens = [
+            self.init_token(entity, location)
+            for entity, location in enumerate(example.initial_state)
+        ]
+        tokens.extend(
+            self.move_token(event.entity, event.src, event.dst)
+            for event in example.events
+        )
+        tokens.append(self.query_token(example.target))
+        return tokens
+
+    def __len__(self) -> int:
+        return len(self.itos)
+
+
+Vocabulary = TokenVocabulary | AtomicVocabulary
+
+
+def encode_example_row(example: StateTrackingExample, vocab: Vocabulary) -> dict[str, object]:
+    return {
+        "input_ids": torch.tensor(vocab.encode_example(example), dtype=torch.long),
+        "example_id": example.example_id,
+        "label": example.answer,
+        "target_depth": example.target_depth,
+        "num_distractors": example.num_distractors,
+        "total_events": example.total_events,
+        "trajectory": example.target_trajectory,
+        "template_split": example.template_split,
+        "text": example.text,
+    }
+
+
 class StateTrackingDataset(Dataset):
-    def __init__(self, examples: Sequence[StateTrackingExample], vocab: TokenVocabulary) -> None:
+    def __init__(self, examples: Sequence[StateTrackingExample], vocab: Vocabulary) -> None:
         self.examples = list(examples)
         self.vocab = vocab
 
@@ -331,18 +437,7 @@ class StateTrackingDataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, index: int) -> dict[str, object]:
-        example = self.examples[index]
-        return {
-            "input_ids": torch.tensor(self.vocab.encode(example.text), dtype=torch.long),
-            "example_id": example.example_id,
-            "label": example.answer,
-            "target_depth": example.target_depth,
-            "num_distractors": example.num_distractors,
-            "total_events": example.total_events,
-            "trajectory": example.target_trajectory,
-            "template_split": example.template_split,
-            "text": example.text,
-        }
+        return encode_example_row(self.examples[index], self.vocab)
 
 
 def collate_examples(rows: Sequence[dict[str, object]], pad_id: int = 0) -> dict[str, object]:
@@ -366,3 +461,101 @@ def collate_examples(rows: Sequence[dict[str, object]], pad_id: int = 0) -> dict
         "template_split": [row["template_split"] for row in rows],
         "text": [row["text"] for row in rows],
     }
+
+
+def _stream_seed(base_seed: int, step: int, sample: int) -> int:
+    """Mix online-example coordinates into a stable 64-bit RNG seed."""
+
+    value = (
+        (base_seed & 0xFFFFFFFFFFFFFFFF)
+        ^ ((step + 1) * 0x9E3779B97F4A7C15)
+        ^ ((sample + 1) * 0xBF58476D1CE4E5B9)
+    ) & 0xFFFFFFFFFFFFFFFF
+    value ^= value >> 30
+    value = (value * 0xBF58476D1CE4E5B9) & 0xFFFFFFFFFFFFFFFF
+    value ^= value >> 27
+    value = (value * 0x94D049BB133111EB) & 0xFFFFFFFFFFFFFFFF
+    return value ^ (value >> 31)
+
+
+class DeterministicOnlineBatchStream(Iterable[dict[str, object]]):
+    """Fresh, reproducible batches under a total-event curriculum.
+
+    Every sample in a batch has the same number of events.  This mirrors the
+    ball-swap online stream and gives the batch a single recurrent loop budget
+    when ``events_per_loop`` is enabled.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_steps: int,
+        batch_size: int,
+        seed: int,
+        min_events: int,
+        max_events: int,
+        steps_per_length: int,
+        num_entities: int,
+        num_locations: int,
+        max_target_depth: int,
+        max_distractors: int,
+        vocab: Vocabulary,
+    ) -> None:
+        if min(num_steps, batch_size, steps_per_length) < 1:
+            raise ValueError("online steps, batch size, and curriculum steps must be positive")
+        if not 1 <= min_events <= max_events:
+            raise ValueError("event curriculum must satisfy 1 <= min <= max")
+        if max_events > max_target_depth + max_distractors:
+            raise ValueError("event curriculum exceeds target-depth and distractor support")
+        if num_entities < 2 or max_target_depth < 1 or max_distractors < 0:
+            raise ValueError("invalid online generation bounds")
+        self.num_steps = num_steps
+        self.batch_size = batch_size
+        self.seed = seed
+        self.min_events = min_events
+        self.max_events = max_events
+        self.steps_per_length = steps_per_length
+        self.num_entities = num_entities
+        self.num_locations = num_locations
+        self.max_target_depth = max_target_depth
+        self.max_distractors = max_distractors
+        self.vocab = vocab
+
+    def __len__(self) -> int:
+        return self.num_steps
+
+    def curriculum_max_events(self, step: int) -> int:
+        if not 0 <= step < self.num_steps:
+            raise IndexError("online training step is out of range")
+        return min(self.max_events, self.min_events + step // self.steps_per_length)
+
+    def _batch_for_step(self, step: int) -> dict[str, object]:
+        current_max = self.curriculum_max_events(step)
+        length_rng = random.Random(_stream_seed(self.seed, step, 0))
+        total_events = length_rng.randint(self.min_events, current_max)
+        min_depth = max(1, total_events - self.max_distractors)
+        max_depth = min(self.max_target_depth, total_events)
+        if min_depth > max_depth:
+            raise ValueError("sampled event count has no valid depth/distractor decomposition")
+
+        rows: list[dict[str, object]] = []
+        for sample_index in range(self.batch_size):
+            sample_seed = _stream_seed(self.seed, step, sample_index + 1)
+            choice_rng = random.Random(sample_seed)
+            target_depth = choice_rng.randint(min_depth, max_depth)
+            generator = StateTrackingGenerator(
+                num_locations=self.num_locations,
+                seed=sample_seed,
+            )
+            example = generator.generate(
+                target_depth=target_depth,
+                num_distractors=total_events - target_depth,
+                num_entities=self.num_entities,
+                linguistic_variation=False,
+            )
+            rows.append(encode_example_row(example, self.vocab))
+        return collate_examples(rows, pad_id=self.vocab.pad_id)
+
+    def __iter__(self) -> Iterator[dict[str, object]]:
+        for step in range(self.num_steps):
+            yield self._batch_for_step(step)

@@ -5,6 +5,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.systematic.data import (
+    AtomicVocabulary,
+    DeterministicOnlineBatchStream,
     StateTrackingDataset,
     StateTrackingGenerator,
     TokenVocabulary,
@@ -79,6 +81,64 @@ def test_generator_split_dedup_and_metadata():
     assert row["template_ids"]
 
 
+def test_atomic_serialization_uses_one_token_per_symbolic_record():
+    example = StateTrackingGenerator(seed=31).generate(
+        target_depth=3, num_distractors=2, num_entities=5,
+    )
+    vocab = AtomicVocabulary(num_entities=5, num_locations=8)
+    tokens = vocab.encode_example(example)
+    assert len(tokens) == example.num_entities + example.total_events + 1
+    assert tokens[-1] == vocab.query_token(example.target)
+    assert len(set(tokens[:example.num_entities])) == example.num_entities
+
+
+def test_atomic_online_stream_is_reproducible_and_event_homogeneous():
+    vocab = AtomicVocabulary(num_entities=5, num_locations=8)
+    settings = dict(
+        num_steps=4,
+        batch_size=6,
+        seed=37,
+        min_events=1,
+        max_events=4,
+        steps_per_length=1,
+        num_entities=5,
+        num_locations=8,
+        max_target_depth=3,
+        max_distractors=2,
+        vocab=vocab,
+    )
+    first = list(DeterministicOnlineBatchStream(**settings))
+    second = list(DeterministicOnlineBatchStream(**settings))
+    assert len(first) == len(second) == 4
+    for left, right in zip(first, second, strict=True):
+        assert torch.equal(left["input_ids"], right["input_ids"])
+        assert torch.equal(left["labels"], right["labels"])
+        assert left["total_events"].unique().numel() == 1
+
+
+def test_natural_online_stream_uses_schema_vocabulary():
+    vocab = TokenVocabulary.from_schema(num_locations=8)
+    stream = DeterministicOnlineBatchStream(
+        num_steps=2,
+        batch_size=4,
+        seed=39,
+        min_events=1,
+        max_events=3,
+        steps_per_length=1,
+        num_entities=6,
+        num_locations=8,
+        max_target_depth=3,
+        max_distractors=2,
+        vocab=vocab,
+    )
+
+    first = next(iter(stream))
+    assert first["input_ids"].shape[0] == 4
+    assert first["input_ids"][:, 0].eq(vocab.cls_id).all()
+    assert int(first["input_ids"].max()) < len(vocab)
+    assert first["total_events"].unique().numel() == 1
+
+
 def tiny_batch():
     generator = StateTrackingGenerator(seed=3)
     examples = [
@@ -108,6 +168,53 @@ def test_r0_allows_more_inference_loops_and_returns_each_state():
     assert len(states) == 5
     assert model.loop_embedding is None
     assert sum(1 for name, _ in model.named_modules() if name == "shared_block") == 1
+
+
+def test_fan_atomic_nope_uses_terminal_query_and_exact_reinjection_update():
+    generator = StateTrackingGenerator(seed=41)
+    examples = [
+        generator.generate(target_depth=2, num_distractors=1, num_entities=5)
+        for _ in range(2)
+    ]
+    vocab = AtomicVocabulary(num_entities=5, num_locations=8)
+    batch = next(iter(DataLoader(
+        StateTrackingDataset(examples, vocab),
+        batch_size=2,
+        collate_fn=partial(collate_examples, pad_id=vocab.pad_id),
+    )))
+    model = StateTrackingTransformer(ModelConfig(
+        vocab_size=len(vocab),
+        num_locations=8,
+        architecture="fan-recurrent",
+        position_encoding="none",
+        readout="last",
+        d_model=16,
+        n_heads=4,
+        d_ff=32,
+        num_layers=1,
+        train_loops=2,
+    ))
+    logits, states = model(
+        batch["input_ids"],
+        batch["attention_mask"],
+        num_loops=3,
+        return_hidden_states=True,
+    )
+    assert logits.shape == (2, 8)
+    assert len(states) == 3
+    expected = model.classifier(model.readout_hidden(states[-1], batch["attention_mask"]))
+    assert torch.allclose(logits, expected)
+
+    # With F_theta replaced by the identity, two Fan updates must produce 2e.
+    embedding, padding = model._embed(batch["input_ids"], batch["attention_mask"])
+    saved_layers = model.shared_layers
+    model.shared_layers = torch.nn.ModuleList()
+    first = model._run_fan_step(embedding, torch.zeros_like(embedding), padding)
+    second = model._run_fan_step(embedding, first, padding)
+    model.shared_layers = saved_layers
+    valid = batch["attention_mask"].unsqueeze(-1)
+    assert torch.allclose(first[valid.expand_as(first)], embedding[valid.expand_as(embedding)])
+    assert torch.allclose(second[valid.expand_as(second)], 2 * embedding[valid.expand_as(embedding)])
 
 
 def test_learned_loop_identity_is_an_explicit_ablation():

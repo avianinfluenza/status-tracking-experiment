@@ -10,8 +10,10 @@ import torch
 from torch import Tensor, nn
 
 
-Architecture = Literal["standard", "recurrent", "untied"]
+Architecture = Literal["standard", "recurrent", "untied", "fan-recurrent"]
 LoopConditioning = Literal["none", "learned"]
+PositionEncoding = Literal["none", "sinusoidal"]
+Readout = Literal["cls", "last"]
 
 
 @dataclass(frozen=True)
@@ -30,9 +32,11 @@ class ModelConfig:
     max_loop_embeddings: int = 64
     loop_conditioning: LoopConditioning = "none"
     residual_scale: float = 1.0
+    position_encoding: PositionEncoding = "sinusoidal"
+    readout: Readout = "cls"
 
     def __post_init__(self) -> None:
-        if self.architecture not in ("standard", "recurrent", "untied"):
+        if self.architecture not in ("standard", "recurrent", "untied", "fan-recurrent"):
             raise ValueError(f"unknown architecture: {self.architecture}")
         if self.d_model <= 0 or self.d_model % self.n_heads:
             raise ValueError("d_model must be positive and divisible by n_heads")
@@ -46,6 +50,17 @@ class ModelConfig:
             raise ValueError("max_loop_embeddings must cover training loops")
         if not 1 <= self.recurrent_blocks <= self.train_loops:
             raise ValueError("recurrent_blocks must be in [1, train_loops]")
+        if self.position_encoding not in ("none", "sinusoidal"):
+            raise ValueError(f"unknown position encoding: {self.position_encoding}")
+        if self.readout not in ("cls", "last"):
+            raise ValueError(f"unknown readout: {self.readout}")
+        if self.architecture == "fan-recurrent":
+            if self.position_encoding != "none":
+                raise ValueError("fan-recurrent requires position_encoding='none'")
+            if self.readout != "last":
+                raise ValueError("fan-recurrent requires the terminal query readout")
+            if self.loop_conditioning != "none" or self.residual_scale != 1.0:
+                raise ValueError("Fan recurrence does not use loop conditioning or residual scaling")
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -99,6 +114,10 @@ class StateTrackingTransformer(nn.Module):
             self.blocks = nn.ModuleList(make_block(config) for _ in range(config.num_layers))
         elif config.architecture == "untied":
             self.blocks = nn.ModuleList(make_block(config) for _ in range(config.train_loops))
+        elif config.architecture == "fan-recurrent":
+            self.shared_layers = nn.ModuleList(
+                make_block(config) for _ in range(config.num_layers)
+            )
         else:
             if config.recurrent_blocks == 1:
                 self.shared_block = make_block(config)
@@ -126,9 +145,28 @@ class StateTrackingTransformer(nn.Module):
             raise ValueError("input_ids and attention_mask must be [batch, sequence]")
         valid = attention_mask.bool()
         x = self.embedding(input_ids) * math.sqrt(self.config.d_model)
-        x = x + self.positions(x.shape[1], device=x.device, dtype=x.dtype).unsqueeze(0)
+        if self.config.position_encoding == "sinusoidal":
+            x = x + self.positions(x.shape[1], device=x.device, dtype=x.dtype).unsqueeze(0)
         x = self.embedding_dropout(x) * valid.unsqueeze(-1)
         return x, ~valid
+
+    @staticmethod
+    def _causal_mask(length: int, device: torch.device) -> Tensor:
+        return torch.ones(length, length, dtype=torch.bool, device=device).triu(1)
+
+    def _run_fan_step(self, embedding: Tensor, hidden: Tensor, padding: Tensor) -> Tensor:
+        """Apply ``h_k = F_theta(h_{k-1} + e)`` with shared causal blocks."""
+
+        hidden = hidden + embedding
+        causal_mask = self._causal_mask(hidden.shape[1], hidden.device)
+        for layer in self.shared_layers:
+            hidden = layer(
+                hidden,
+                src_mask=causal_mask,
+                src_key_padding_mask=padding,
+                is_causal=True,
+            )
+        return hidden * (~padding).unsqueeze(-1).to(dtype=hidden.dtype)
 
     def _run_recurrent_step(self, x: Tensor, padding: Tensor, step: int) -> Tensor:
         conditioned = x
@@ -169,6 +207,15 @@ class StateTrackingTransformer(nn.Module):
             for block in self.blocks[:steps]:
                 x = block(x, src_key_padding_mask=padding)
                 hidden_states.append(self.final_norm(x))
+        elif self.config.architecture == "fan-recurrent":
+            steps = self.config.train_loops if num_loops is None else num_loops
+            if steps < 1:
+                raise ValueError("num_loops must be positive")
+            embedding = x
+            x = torch.zeros_like(embedding)
+            for _ in range(steps):
+                x = self._run_fan_step(embedding, x, padding)
+                hidden_states.append(self.final_norm(x))
         else:
             steps = self.config.train_loops if num_loops is None else num_loops
             if steps < 1:
@@ -180,6 +227,15 @@ class StateTrackingTransformer(nn.Module):
                 hidden_states.append(self.final_norm(x))
         final = self.final_norm(x)
         return (final, tuple(hidden_states)) if return_hidden_states else final
+
+    def readout_hidden(self, hidden: Tensor, attention_mask: Tensor) -> Tensor:
+        if self.config.readout == "cls":
+            return hidden[:, 0]
+        positions = attention_mask.long().sum(dim=1) - 1
+        if bool((positions < 0).any()):
+            raise ValueError("every sample must contain at least one non-padding token")
+        indices = positions.view(-1, 1, 1).expand(-1, 1, hidden.shape[-1])
+        return hidden.gather(1, indices).squeeze(1)
 
     def forward(
         self,
@@ -197,8 +253,8 @@ class StateTrackingTransformer(nn.Module):
         )
         if return_hidden_states:
             final, hidden_states = encoded
-            return self.classifier(final[:, 0]), hidden_states
-        return self.classifier(encoded[:, 0])
+            return self.classifier(self.readout_hidden(final, attention_mask)), hidden_states
+        return self.classifier(self.readout_hidden(encoded, attention_mask))
 
     @torch.inference_mode()
     def forward_adaptive(
@@ -307,10 +363,13 @@ def estimate_forward_flops(config: ModelConfig, sequence_length: int, *, num_loo
 
     if sequence_length < 1:
         raise ValueError("sequence_length must be positive")
+    loops = config.train_loops if num_loops is None else num_loops
     depth = (
         config.num_layers
         if config.architecture == "standard"
-        else (config.train_loops if num_loops is None else num_loops)
+        else config.num_layers * loops
+        if config.architecture == "fan-recurrent"
+        else loops
     )
     d, ff, length = config.d_model, config.d_ff, sequence_length
     # Q/K/V/output projections + attention score/value products + two FFN projections.

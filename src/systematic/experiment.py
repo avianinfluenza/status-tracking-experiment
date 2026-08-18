@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from .model import StateTrackingTransformer
 
@@ -31,6 +32,31 @@ def _synchronize(device: torch.device) -> None:
         torch.mps.synchronize()
 
 
+def progress_bar(
+    iterable: Iterable,
+    *,
+    total: int | None,
+    desc: str,
+    leave: bool,
+    position: int,
+):
+    return tqdm(
+        iterable,
+        total=total,
+        desc=desc,
+        leave=leave,
+        position=position,
+        dynamic_ncols=True,
+    )
+
+
+def _progress_total(iterable: Iterable) -> int | None:
+    try:
+        return len(iterable)  # type: ignore[arg-type]
+    except TypeError:
+        return None
+
+
 @dataclass(frozen=True)
 class TrainMetrics:
     loss: float
@@ -42,44 +68,82 @@ class TrainMetrics:
 
 def train_epoch(
     model: StateTrackingTransformer,
-    loader: DataLoader,
+    loader: Iterable[dict[str, object]],
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     *,
     grad_clip: float = 1.0,
     random_loop_range: tuple[int, int] | None = None,
+    events_per_loop: float | None = None,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+    progress_position: int = 1,
 ) -> TrainMetrics:
     """Final-answer supervision only; no intermediate-state loss is applied."""
 
+    if events_per_loop is not None and events_per_loop <= 0:
+        raise ValueError("events_per_loop must be positive")
+    if events_per_loop is not None and random_loop_range is not None:
+        raise ValueError("event-proportional and random loop schedules are mutually exclusive")
     model.train()
     totals = defaultdict(float)
     n_samples = 0
-    for batch_cpu in loader:
-        batch = move_batch(batch_cpu, device)
-        loops = None
-        if random_loop_range is not None:
-            if model.config.architecture != "recurrent":
-                raise ValueError("random loops are only valid for the recurrent model")
-            loops = random.randint(*random_loop_range)
-        logits, hidden_states = model(
-            batch["input_ids"],
-            batch["attention_mask"],
-            num_loops=loops,
-            return_hidden_states=True,
+    progress = None
+    batches: Iterable[dict[str, object]] = loader
+    if show_progress:
+        progress = progress_bar(
+            loader,
+            total=_progress_total(loader),
+            desc=progress_desc or "train",
+            leave=False,
+            position=progress_position,
         )
-        loss = F.cross_entropy(logits, batch["labels"])
-        optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        grad_norm = clip_grad_norm_(model.parameters(), grad_clip)
-        optimizer.step()
+        batches = progress
+    try:
+        for batch_cpu in batches:
+            batch = move_batch(batch_cpu, device)
+            loops = None
+            if random_loop_range is not None:
+                if model.config.architecture != "recurrent":
+                    raise ValueError("random loops are only valid for the recurrent model")
+                loops = random.randint(*random_loop_range)
+            elif events_per_loop is not None:
+                event_counts = batch["total_events"]
+                loop_counts = torch.ceil(event_counts.float() / events_per_loop).long()
+                if not bool((loop_counts == loop_counts[0]).all()):
+                    raise ValueError("event-proportional training batches must share one loop count")
+                loops = int(loop_counts[0].item())
+            logits, hidden_states = model(
+                batch["input_ids"],
+                batch["attention_mask"],
+                num_loops=loops,
+                return_hidden_states=True,
+            )
+            loss = F.cross_entropy(logits, batch["labels"])
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            grad_norm = clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
 
-        size = int(batch["labels"].shape[0])
-        totals["loss"] += float(loss.item()) * size
-        totals["correct"] += int((logits.argmax(-1) == batch["labels"]).sum().item())
-        totals["grad_norm"] += float(grad_norm) * size
-        totals["hidden_norm"] += float(hidden_states[-1].norm(dim=-1).mean().item()) * size
-        totals["loops"] += float(loops or model.config.train_loops) * size
-        n_samples += size
+            size = int(batch["labels"].shape[0])
+            totals["loss"] += float(loss.item()) * size
+            totals["correct"] += int((logits.argmax(-1) == batch["labels"]).sum().item())
+            totals["grad_norm"] += float(grad_norm) * size
+            totals["hidden_norm"] += float(hidden_states[-1].norm(dim=-1).mean().item()) * size
+            totals["loops"] += float(loops or model.config.train_loops) * size
+            n_samples += size
+            if progress is not None:
+                progress.set_postfix(
+                    loss=f"{totals['loss'] / max(n_samples, 1):.4f}",
+                    accuracy=f"{totals['correct'] / max(n_samples, 1):.4f}",
+                    loops=f"{totals['loops'] / max(n_samples, 1):.2f}",
+                )
+    finally:
+        if progress is not None:
+            progress.close()
     return TrainMetrics(
         loss=totals["loss"] / n_samples,
         accuracy=totals["correct"] / n_samples,
@@ -96,8 +160,16 @@ def evaluate(
     device: torch.device,
     *,
     num_loops: int | None = None,
+    events_per_loop: float | None = None,
     collect_predictions: bool = False,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+    progress_position: int = 1,
 ) -> dict[str, object]:
+    if num_loops is not None and events_per_loop is not None:
+        raise ValueError("explicit and event-proportional loop counts are mutually exclusive")
+    if events_per_loop is not None and events_per_loop <= 0:
+        raise ValueError("events_per_loop must be positive")
     model.eval()
     loss_sum = 0.0
     correct = 0
@@ -108,47 +180,73 @@ def evaluate(
     prediction_rows: list[dict[str, object]] = []
     _synchronize(device)
     start_time = time.perf_counter()
-    for batch_cpu in loader:
-        batch = move_batch(batch_cpu, device)
-        logits, states = model(
-            batch["input_ids"],
-            batch["attention_mask"],
-            num_loops=num_loops,
-            return_hidden_states=True,
+    progress = None
+    batches: Iterable[dict[str, object]] = loader
+    if show_progress:
+        progress = progress_bar(
+            loader,
+            total=_progress_total(loader),
+            desc=progress_desc or "eval",
+            leave=False,
+            position=progress_position,
         )
-        labels = batch["labels"]
-        predictions = logits.argmax(-1)
-        probabilities = logits.softmax(-1)
-        confidences = probabilities.amax(-1)
-        per_example_nll = F.cross_entropy(logits, labels, reduction="none")
-        size = int(labels.shape[0])
-        loss_sum += float(F.cross_entropy(logits, labels).item()) * size
-        correct += int((predictions == labels).sum().item())
-        n_samples += size
-        hidden_norm_sum += float(states[-1].norm(dim=-1).mean().item()) * size
-        if len(states) > 1:
-            delta = (states[-1] - states[-2]).norm(dim=-1).mean()
-            base = states[-2].norm(dim=-1).mean().clamp_min(1e-8)
-            update_ratio_sum += float((delta / base).item()) * size
-        for depth, prediction, label in zip(
-            batch_cpu["target_depth"].tolist(), predictions.cpu().tolist(), labels.cpu().tolist()
-        ):
-            by_depth[int(depth)][0] += int(prediction == label)
-            by_depth[int(depth)][1] += 1
-        if collect_predictions:
-            for index in range(size):
-                prediction_rows.append({
-                    "example_id": batch_cpu["example_id"][index],
-                    "target_depth": int(batch_cpu["target_depth"][index]),
-                    "num_distractors": int(batch_cpu["num_distractors"][index]),
-                    "total_events": int(batch_cpu["total_events"][index]),
-                    "template_split": batch_cpu["template_split"][index],
-                    "label": int(labels[index].item()),
-                    "prediction": int(predictions[index].item()),
-                    "correct": bool((predictions[index] == labels[index]).item()),
-                    "confidence": float(confidences[index].item()),
-                    "nll": float(per_example_nll[index].item()),
-                })
+        batches = progress
+    try:
+        for batch_cpu in batches:
+            batch = move_batch(batch_cpu, device)
+            batch_loops = num_loops
+            if events_per_loop is not None:
+                loop_counts = torch.ceil(batch["total_events"].float() / events_per_loop).long()
+                if not bool((loop_counts == loop_counts[0]).all()):
+                    raise ValueError("event-proportional evaluation loaders must bucket total events")
+                batch_loops = int(loop_counts[0].item())
+            logits, states = model(
+                batch["input_ids"],
+                batch["attention_mask"],
+                num_loops=batch_loops,
+                return_hidden_states=True,
+            )
+            labels = batch["labels"]
+            predictions = logits.argmax(-1)
+            probabilities = logits.softmax(-1)
+            confidences = probabilities.amax(-1)
+            per_example_nll = F.cross_entropy(logits, labels, reduction="none")
+            size = int(labels.shape[0])
+            loss_sum += float(F.cross_entropy(logits, labels).item()) * size
+            correct += int((predictions == labels).sum().item())
+            n_samples += size
+            hidden_norm_sum += float(states[-1].norm(dim=-1).mean().item()) * size
+            if len(states) > 1:
+                delta = (states[-1] - states[-2]).norm(dim=-1).mean()
+                base = states[-2].norm(dim=-1).mean().clamp_min(1e-8)
+                update_ratio_sum += float((delta / base).item()) * size
+            for depth, prediction, label in zip(
+                batch_cpu["target_depth"].tolist(), predictions.cpu().tolist(), labels.cpu().tolist()
+            ):
+                by_depth[int(depth)][0] += int(prediction == label)
+                by_depth[int(depth)][1] += 1
+            if collect_predictions:
+                for index in range(size):
+                    prediction_rows.append({
+                        "example_id": batch_cpu["example_id"][index],
+                        "target_depth": int(batch_cpu["target_depth"][index]),
+                        "num_distractors": int(batch_cpu["num_distractors"][index]),
+                        "total_events": int(batch_cpu["total_events"][index]),
+                        "template_split": batch_cpu["template_split"][index],
+                        "label": int(labels[index].item()),
+                        "prediction": int(predictions[index].item()),
+                        "correct": bool((predictions[index] == labels[index]).item()),
+                        "confidence": float(confidences[index].item()),
+                        "nll": float(per_example_nll[index].item()),
+                    })
+            if progress is not None:
+                progress.set_postfix(
+                    loss=f"{loss_sum / max(n_samples, 1):.4f}",
+                    accuracy=f"{correct / max(n_samples, 1):.4f}",
+                )
+    finally:
+        if progress is not None:
+            progress.close()
     _synchronize(device)
     elapsed = time.perf_counter() - start_time
     result: dict[str, object] = {
@@ -156,6 +254,7 @@ def evaluate(
         "accuracy": correct / max(n_samples, 1),
         "n_samples": n_samples,
         "num_loops": num_loops,
+        "events_per_loop": events_per_loop,
         "hidden_norm": hidden_norm_sum / max(n_samples, 1),
         "final_update_ratio": update_ratio_sum / max(n_samples, 1),
         "latency_seconds": elapsed,
@@ -190,16 +289,41 @@ def loop_depth_sweep(
     loaders_by_depth: dict[int, DataLoader],
     loop_counts: Sequence[int],
     device: torch.device,
+    *,
+    show_progress: bool = False,
+    progress_desc: str = "E2 loop-depth",
+    progress_position: int = 1,
 ) -> list[dict[str, object]]:
     """E3: full reasoning-depth × inference-loop matrix."""
 
     if model.config.architecture != "recurrent":
         raise ValueError("loop sweep requires a recurrent model")
     rows = []
-    for depth, loader in sorted(loaders_by_depth.items()):
-        for loops in loop_counts:
+    cells = [
+        (depth, loader, loops)
+        for depth, loader in sorted(loaders_by_depth.items())
+        for loops in loop_counts
+    ]
+    progress = None
+    iterable: Iterable[tuple[int, DataLoader, int]] = cells
+    if show_progress:
+        progress = progress_bar(
+            cells,
+            total=len(cells),
+            desc=progress_desc,
+            leave=False,
+            position=progress_position,
+        )
+        iterable = progress
+    try:
+        for depth, loader, loops in iterable:
             metrics = evaluate(model, loader, device, num_loops=loops)
             rows.append({"target_depth": depth, "num_loops": loops, **metrics})
+            if progress is not None:
+                progress.set_postfix(depth=depth, loops=loops)
+    finally:
+        if progress is not None:
+            progress.close()
     return rows
 
 
@@ -249,6 +373,9 @@ def collect_loop_cls_states(
     device: torch.device,
     *,
     num_loops: int,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+    progress_position: int = 1,
 ) -> tuple[Tensor, Tensor]:
     """E7 feature extraction. Probe fitting is intentionally separate."""
 
@@ -256,14 +383,29 @@ def collect_loop_cls_states(
         raise ValueError("loop probes require a recurrent model")
     model.eval()
     features, labels = [], []
-    for batch_cpu in loader:
-        batch = move_batch(batch_cpu, device)
-        _, states = model(
-            batch["input_ids"], batch["attention_mask"],
-            num_loops=num_loops, return_hidden_states=True,
+    progress = None
+    batches: Iterable[dict[str, object]] = loader
+    if show_progress:
+        progress = progress_bar(
+            loader,
+            total=_progress_total(loader),
+            desc=progress_desc or "probe features",
+            leave=False,
+            position=progress_position,
         )
-        features.append(torch.stack([state[:, 0] for state in states], dim=1).cpu())
-        labels.append(batch["labels"].cpu())
+        batches = progress
+    try:
+        for batch_cpu in batches:
+            batch = move_batch(batch_cpu, device)
+            _, states = model(
+                batch["input_ids"], batch["attention_mask"],
+                num_loops=num_loops, return_hidden_states=True,
+            )
+            features.append(torch.stack([state[:, 0] for state in states], dim=1).cpu())
+            labels.append(batch["labels"].cpu())
+    finally:
+        if progress is not None:
+            progress.close()
     return torch.cat(features), torch.cat(labels)
 
 
@@ -323,6 +465,9 @@ def trajectory_readout_matrix(
     device: torch.device,
     *,
     num_loops: int,
+    show_progress: bool = False,
+    progress_desc: str | None = None,
+    progress_position: int = 1,
 ) -> list[dict[str, float | int]]:
     """Compare each loop readout with every symbolic intermediate state.
 
@@ -337,23 +482,38 @@ def trajectory_readout_matrix(
     hits: Tensor | None = None
     total = 0
     model.eval()
-    for batch_cpu in loader:
-        batch = move_batch(batch_cpu, device)
-        _, states = model(
-            batch["input_ids"], batch["attention_mask"],
-            num_loops=num_loops, return_hidden_states=True,
+    progress = None
+    batches: Iterable[dict[str, object]] = loader
+    if show_progress:
+        progress = progress_bar(
+            loader,
+            total=_progress_total(loader),
+            desc=progress_desc or "trajectory readout",
+            leave=False,
+            position=progress_position,
         )
-        trajectories = batch_cpu["trajectory"]
-        trajectory_lengths = {len(trajectory) for trajectory in trajectories}
-        if len(trajectory_lengths) != 1:
-            raise ValueError("trajectory matrix requires a fixed target depth")
-        gold = torch.tensor(trajectories, device=device, dtype=torch.long)
-        predictions = torch.stack(
-            [model.classifier(state[:, 0]).argmax(-1) for state in states], dim=1
-        )
-        batch_hits = (predictions.unsqueeze(-1) == gold.unsqueeze(1)).sum(0).cpu()
-        hits = batch_hits if hits is None else hits + batch_hits
-        total += predictions.shape[0]
+        batches = progress
+    try:
+        for batch_cpu in batches:
+            batch = move_batch(batch_cpu, device)
+            _, states = model(
+                batch["input_ids"], batch["attention_mask"],
+                num_loops=num_loops, return_hidden_states=True,
+            )
+            trajectories = batch_cpu["trajectory"]
+            trajectory_lengths = {len(trajectory) for trajectory in trajectories}
+            if len(trajectory_lengths) != 1:
+                raise ValueError("trajectory matrix requires a fixed target depth")
+            gold = torch.tensor(trajectories, device=device, dtype=torch.long)
+            predictions = torch.stack(
+                [model.classifier(state[:, 0]).argmax(-1) for state in states], dim=1
+            )
+            batch_hits = (predictions.unsqueeze(-1) == gold.unsqueeze(1)).sum(0).cpu()
+            hits = batch_hits if hits is None else hits + batch_hits
+            total += predictions.shape[0]
+    finally:
+        if progress is not None:
+            progress.close()
     if hits is None:
         return []
     return [
