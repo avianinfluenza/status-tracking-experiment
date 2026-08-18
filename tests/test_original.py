@@ -748,6 +748,7 @@ def test_validation_and_full_training_checkpoint_roundtrip(tmp_path) -> None:
     assert loaded["optimizer_state"] is not None
     assert loaded["scheduler_state"] is not None
     assert loaded["best_epoch"] == 1
+    assert all(not key.startswith("_orig_mod.") for key in loaded["model_state"])
 
 
 def test_yaml_wires_training_infrastructure_options() -> None:

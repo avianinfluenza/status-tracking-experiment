@@ -27,6 +27,7 @@ from tqdm.auto import tqdm
 
 from ..data.collate import BallSwapDataset, collate_fn, encode_event
 from ..data.vocab import N_ENTITIES
+from ..runtime import maybe_compile_model, uncompiled_model, uncompiled_state_dict
 from .data import (
     DeterministicOnlineBatchStream,
     ExplicitCoTDataset,
@@ -69,17 +70,6 @@ def resolve_device(requested: str) -> torch.device:
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-def maybe_compile_model(model: nn.Module, device: torch.device) -> nn.Module:
-    """Compile the model forward path on CUDA while preserving its concrete type."""
-
-    if device.type != "cuda":
-        return model
-    if not hasattr(torch, "compile"):
-        raise RuntimeError("CUDA execution requires a PyTorch build with torch.compile")
-    model.forward = torch.compile(model.forward)  # type: ignore[method-assign]
-    return model
 
 
 def _subset(dataset: Dataset, maximum: int | None) -> Dataset:
@@ -1316,11 +1306,12 @@ def save_training_checkpoint(
     training_seconds: float,
     run_config: dict[str, object],
 ) -> dict[str, object]:
+    base_model = uncompiled_model(model)
     state: dict[str, object] = {
         "format_version": 2,
-        "config": model.config.to_dict(),
+        "config": base_model.config.to_dict(),  # type: ignore[attr-defined]
         "run_config": run_config,
-        "model_state": model.state_dict(),
+        "model_state": uncompiled_state_dict(model),
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
         "scaler_state": scaler.state_dict() if scaler is not None else None,
