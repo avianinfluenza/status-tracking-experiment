@@ -232,8 +232,6 @@ class StateTrackingTransformer(nn.Module):
         if self.config.readout == "cls":
             return hidden[:, 0]
         positions = attention_mask.long().sum(dim=1) - 1
-        if bool((positions < 0).any()):
-            raise ValueError("every sample must contain at least one non-padding token")
         indices = positions.view(-1, 1, 1).expand(-1, 1, hidden.shape[-1])
         return hidden.gather(1, indices).squeeze(1)
 
