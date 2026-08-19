@@ -63,6 +63,7 @@ class OriginalModelConfig:
     fan_positional_control: bool = False
     direct_input_format: DirectInputFormat = "template"
     direct_causal: bool = False
+    atomic_position_period: int | None = None
 
     def __post_init__(self) -> None:
         if self.architecture not in (
@@ -92,6 +93,19 @@ class OriginalModelConfig:
                 raise ValueError(
                     "fan-recurrent requires position_encoding='none' unless "
                     "fan_positional_control=True"
+                )
+        if self.atomic_position_period is not None:
+            if self.atomic_position_period < 1:
+                raise ValueError("atomic_position_period must be positive")
+            if (
+                self.architecture != "fan-recurrent"
+                or self.fan_input_format != "atomic"
+                or self.position_encoding != "sinusoidal"
+                or not self.fan_positional_control
+            ):
+                raise ValueError(
+                    "atomic_position_period requires atomic fan-recurrent sinusoidal "
+                    "positional control"
                 )
         if self.d_model <= 0 or self.d_model % self.n_heads:
             raise ValueError("d_model must be positive and divisible by n_heads")
@@ -163,6 +177,45 @@ class SinusoidalPositionEncoding(nn.Module):
 def _logical_positions(attention_mask: Tensor) -> Tensor:
     positions = attention_mask.long().cumsum(dim=1) - 1
     return positions.clamp_min(0)
+
+
+def atomic_periodic_positions(attention_mask: Tensor, max_swaps: int) -> Tensor:
+    """Repeat atomic swap positions after the trained swap window.
+
+    Atomic fan inputs are serialized as five initial-assignment tokens, then
+    one token per swap, optional PADs, and five output SLOT tokens.  For samples
+    at or below ``max_swaps`` this returns the normal logical positions.  For
+    longer samples, extra swap tokens reuse the trained swap-position window
+    and the output SLOT tokens stay at the terminal positions of a max-length
+    training example.
+    """
+
+    if attention_mask.ndim != 2:
+        raise ValueError("attention_mask must have shape [B, L]")
+    if max_swaps < 1:
+        raise ValueError("max_swaps must be positive")
+    valid = attention_mask.bool()
+    logical = _logical_positions(attention_mask)
+    active_lengths = attention_mask.long().sum(dim=1)
+    swap_counts = active_lengths - 2 * N_ENTITIES
+
+    swap_start = N_ENTITIES
+    swap_end = swap_start + swap_counts[:, None]
+    slot_base = torch.where(
+        swap_counts > max_swaps,
+        torch.full_like(swap_counts, swap_start + max_swaps),
+        swap_end.squeeze(1),
+    )[:, None]
+    positions = logical.clone()
+    swap_mask = valid & (logical >= swap_start) & (logical < swap_end)
+    positions = torch.where(
+        swap_mask,
+        swap_start + torch.remainder(logical - swap_start, max_swaps),
+        positions,
+    )
+    slot_mask = valid & (logical >= swap_end)
+    positions = torch.where(slot_mask, slot_base + (logical - swap_end), positions)
+    return positions * valid.long()
 
 
 def _rotate_half(x: Tensor) -> Tensor:
@@ -296,14 +349,33 @@ class TokenBackbone(nn.Module):
         self.sinusoidal = SinusoidalPositionEncoding(config.d_model)
         self.embedding_dropout = nn.Dropout(config.dropout)
         self.final_norm = nn.LayerNorm(config.d_model)
+        self._atomic_periodic_position_max_swaps = config.atomic_position_period
         nn.init.normal_(self.embedding.weight, std=0.02)
         with torch.no_grad():
             self.embedding.weight[pad_id].zero_()
 
+    def use_atomic_periodic_positions(self, max_swaps: int | None) -> None:
+        """Set an eval-time atomic periodic position override.
+
+        Passing ``None`` restores the normal logical positions.  This is a
+        runtime diagnostic switch and intentionally not part of checkpointed
+        model config.
+        """
+
+        if max_swaps is not None and max_swaps < 1:
+            raise ValueError("max_swaps must be positive")
+        self._atomic_periodic_position_max_swaps = max_swaps
+
     def prepare(self, input_ids: Tensor, attention_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if input_ids.ndim != 2 or input_ids.shape != attention_mask.shape:
             raise ValueError("input_ids and attention_mask must have shape [B, L]")
-        positions = _logical_positions(attention_mask)
+        if self._atomic_periodic_position_max_swaps is None:
+            positions = _logical_positions(attention_mask)
+        else:
+            positions = atomic_periodic_positions(
+                attention_mask,
+                self._atomic_periodic_position_max_swaps,
+            )
         e = self.embedding(input_ids) * math.sqrt(self.config.d_model)
         h = e
         if self.config.position_encoding == "sinusoidal":

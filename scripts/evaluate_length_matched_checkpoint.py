@@ -53,6 +53,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval-batch-size", type=int, default=128)
     parser.add_argument("--max-eval-samples", type=int, default=None)
     parser.add_argument(
+        "--periodic-atomic-positions",
+        action="store_true",
+        help=(
+            "diagnostic eval-only override for atomic+sinusoidal Fan checkpoints: "
+            "repeat swap position ids after the trained max swap length"
+        ),
+    )
+    parser.add_argument(
+        "--periodic-position-max-swaps",
+        type=int,
+        default=None,
+        help="trained swap-window length for --periodic-atomic-positions; defaults to checkpoint args.json curriculum_max_swaps",
+    )
+    parser.add_argument(
         "--slot-first",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -84,20 +98,47 @@ def main() -> None:
     ):
         raise SystemExit("length-matched evaluation requires a recurrent checkpoint")
     model.load_state_dict(model_state, strict=True)
-    device = resolve_device(args.device)
-    maybe_compile_model(model.to(device), device)
 
-    run_args_path = args.checkpoint.parent / "args.json"
-    saved_run_args = {}
-    if run_args_path.is_file():
-        loaded_args = json.loads(run_args_path.read_text(encoding="utf-8"))
-        if isinstance(loaded_args, dict):
-            saved_run_args = loaded_args
+    saved_run_args: dict[str, object] = {}
+    checkpoint_run_config = payload.get("run_config")
+    if isinstance(checkpoint_run_config, dict):
+        saved_run_args = checkpoint_run_config
+    for run_args_path in (
+        args.checkpoint.parent / "args.json",
+        args.checkpoint.parent.parent / "args.json",
+    ):
+        if run_args_path.is_file():
+            loaded_args = json.loads(run_args_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_args, dict):
+                saved_run_args = loaded_args
+            break
     slot_first = (
         bool(saved_run_args.get("slot_first", False))
         if args.slot_first is None
         else args.slot_first
     )
+    periodic_position_max_swaps = args.periodic_position_max_swaps
+    if args.periodic_atomic_positions:
+        if not isinstance(model, FanRecurrentTransformer):
+            raise SystemExit("--periodic-atomic-positions requires a fan-recurrent checkpoint")
+        if config.fan_input_format != "atomic" or config.position_encoding != "sinusoidal":
+            raise SystemExit(
+                "--periodic-atomic-positions requires atomic input and sinusoidal positions"
+            )
+        if periodic_position_max_swaps is None:
+            saved_max_swaps = saved_run_args.get("curriculum_max_swaps")
+            if isinstance(saved_max_swaps, int) and not isinstance(saved_max_swaps, bool):
+                periodic_position_max_swaps = saved_max_swaps
+            else:
+                raise SystemExit(
+                    "--periodic-position-max-swaps is required when args.json does not provide curriculum_max_swaps"
+                )
+        if periodic_position_max_swaps < 1:
+            raise SystemExit("--periodic-position-max-swaps must be positive")
+        model.use_atomic_periodic_positions(periodic_position_max_swaps)
+
+    device = resolve_device(args.device)
+    model = maybe_compile_model(model.to(device), device)
 
     splits: dict[str, object] = {}
     for split in args.splits:
@@ -110,10 +151,14 @@ def main() -> None:
             batch_size=args.eval_batch_size,
             shuffle=False,
             seed=0,
-        max_samples=args.max_eval_samples,
-        slot_first=slot_first,
-        swaps_per_loop=args.swaps_per_loop,
-        input_format=config.fan_input_format if isinstance(model, FanRecurrentTransformer) else "template",
+            max_samples=args.max_eval_samples,
+            slot_first=slot_first,
+            swaps_per_loop=args.swaps_per_loop,
+            input_format=(
+                config.fan_input_format
+                if isinstance(model, FanRecurrentTransformer)
+                else "template"
+            ),
         )
         metrics = evaluate_length_matched_classifier(
             model,
@@ -143,6 +188,20 @@ def main() -> None:
         "swaps_per_loop": args.swaps_per_loop,
         "fixed_loop_counts": sorted(set(args.fixed_loop_counts or [])),
         "slot_first": slot_first,
+        "position_override": {
+            "mode": (
+                "atomic_periodic_eval_override"
+                if args.periodic_atomic_positions
+                else "atomic_periodic_config"
+                if config.atomic_position_period is not None
+                else "default"
+            ),
+            "max_swaps": (
+                periodic_position_max_swaps
+                if args.periodic_atomic_positions
+                else config.atomic_position_period
+            ),
+        },
         "splits": splits,
     }
     rendered = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)

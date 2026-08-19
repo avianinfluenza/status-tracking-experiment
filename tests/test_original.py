@@ -52,6 +52,7 @@ from src.original.model import (
     OriginalModelConfig,
     RecurrentR0Transformer,
     RecurrentTransformer,
+    atomic_periodic_positions,
 )
 from src.trainer import config_to_argv
 
@@ -64,6 +65,13 @@ def sample_row() -> dict[str, object]:
         "n_swaps": 3,
         "text": "",
     }
+
+
+def sample_row_with_swaps(n_swaps: int) -> dict[str, object]:
+    row = sample_row()
+    row["swaps"] = [[index % 5, (index + 1) % 5] for index in range(n_swaps)]
+    row["n_swaps"] = n_swaps
+    return row
 
 
 def trajectory_row() -> dict[str, object]:
@@ -413,6 +421,134 @@ def test_fan_controls_require_explicit_compatible_configurations() -> None:
             architecture="fan-recurrent",
             position_encoding="sinusoidal",
             fan_input_format="atomic",
+        )
+
+
+def test_atomic_periodic_positions_preserve_id_and_repeat_ood_swaps() -> None:
+    batch = collate_fn(
+        [sample_row_with_swaps(3), sample_row_with_swaps(5)],
+        input_format="atomic",
+    )
+    positions = atomic_periodic_positions(batch["attn_mask"], max_swaps=3)
+
+    short_valid = batch["attn_mask"][0].bool()
+    long_valid = batch["attn_mask"][1].bool()
+    assert positions[0, short_valid].tolist() == list(range(13))
+    assert positions[1, long_valid].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        5,
+        6,
+        8,
+        9,
+        10,
+        11,
+        12,
+    ]
+
+
+def test_fan_model_can_use_eval_only_atomic_periodic_positions() -> None:
+    batch = collate_fn([sample_row_with_swaps(5)], input_format="atomic")
+    model = FanRecurrentTransformer(
+        OriginalModelConfig(
+            architecture="fan-recurrent",
+            position_encoding="sinusoidal",
+            fan_input_format="atomic",
+            fan_positional_control=True,
+            d_model=32,
+            n_heads=4,
+            d_ff=64,
+            num_layers=1,
+        )
+    )
+
+    _, _, default_positions = model.prepare(batch["input_ids"], batch["attn_mask"])
+    model.use_atomic_periodic_positions(3)
+    _, _, periodic_positions = model.prepare(batch["input_ids"], batch["attn_mask"])
+    model.use_atomic_periodic_positions(None)
+    _, _, reset_positions = model.prepare(batch["input_ids"], batch["attn_mask"])
+
+    valid = batch["attn_mask"][0].bool()
+    assert default_positions[0, valid].tolist() == list(range(15))
+    assert periodic_positions[0, valid].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        5,
+        6,
+        8,
+        9,
+        10,
+        11,
+        12,
+    ]
+    torch.testing.assert_close(reset_positions, default_positions)
+
+
+def test_atomic_position_period_config_applies_during_prepare() -> None:
+    batch = collate_fn([sample_row_with_swaps(7)], input_format="atomic")
+    model = FanRecurrentTransformer(
+        OriginalModelConfig(
+            architecture="fan-recurrent",
+            position_encoding="sinusoidal",
+            fan_input_format="atomic",
+            fan_positional_control=True,
+            atomic_position_period=5,
+            d_model=32,
+            n_heads=4,
+            d_ff=64,
+            num_layers=1,
+        )
+    )
+
+    _, _, positions = model.prepare(batch["input_ids"], batch["attn_mask"])
+    assert positions[0, batch["attn_mask"][0].bool()].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        5,
+        6,
+        10,
+        11,
+        12,
+        13,
+        14,
+    ]
+
+
+def test_atomic_position_period_rejects_non_atomic_sinusoidal_fan() -> None:
+    with pytest.raises(ValueError, match="atomic_position_period requires"):
+        OriginalModelConfig(
+            architecture="fan-recurrent",
+            position_encoding="sinusoidal",
+            fan_positional_control=True,
+            atomic_position_period=5,
+        )
+    with pytest.raises(ValueError, match="atomic_position_period must be positive"):
+        OriginalModelConfig(
+            architecture="fan-recurrent",
+            position_encoding="sinusoidal",
+            fan_input_format="atomic",
+            fan_positional_control=True,
+            atomic_position_period=0,
         )
 
 
