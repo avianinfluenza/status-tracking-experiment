@@ -1102,6 +1102,24 @@ def test_fan_yaml_maps_online_curriculum_to_cli() -> None:
     assert arguments[arguments.index("--curriculum-max-swaps") + 1] == "10"
 
 
+def test_fan_periodic_atomic_yaml_maps_to_cli() -> None:
+    arguments = config_to_argv({
+        "architecture": "fan_recurrent",
+        "position_encoding": "sinusoidal",
+        "fan_input_format": "atomic",
+        "fan_positional_control": True,
+        "atomic_position_period": 5,
+        "training": {
+            "online_training": True,
+            "train_steps": 100,
+            "swaps_per_loop": 1.0,
+        },
+    })
+    assert "--fan-positional-control" in arguments
+    assert "--atomic-position-period" in arguments
+    assert arguments[arguments.index("--atomic-position-period") + 1] == "5"
+
+
 def test_fan_smoke_uses_length_matched_final_only_training(tmp_path: Path) -> None:
     result = run(parse_args([
         "--architecture", "fan-recurrent",

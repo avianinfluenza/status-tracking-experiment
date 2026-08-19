@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
                         default="sinusoidal")
     parser.add_argument("--fan-input-format", choices=("template", "atomic"), default="template")
     parser.add_argument("--fan-positional-control", action="store_true")
+    parser.add_argument("--atomic-position-period", type=int, default=None)
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--n-heads", type=int, default=4)
@@ -107,7 +108,18 @@ def main() -> None:
     if args.adaptive_max_loops is not None and not args.adaptive_kl_eval:
         raise SystemExit("--adaptive-max-loops requires --adaptive-kl-eval")
     if "fan-recurrent" in args.architectures:
-        if args.fan_input_format == "atomic":
+        if args.atomic_position_period is not None:
+            if args.atomic_position_period < 1:
+                raise SystemExit("--atomic-position-period must be positive")
+            if (
+                args.fan_input_format != "atomic"
+                or args.position_encoding != "sinusoidal"
+                or not args.fan_positional_control
+            ):
+                raise SystemExit(
+                    "--atomic-position-period requires atomic input with sinusoidal positional control"
+                )
+        elif args.fan_input_format == "atomic":
             if args.position_encoding != "none" or args.fan_positional_control:
                 raise SystemExit("atomic Fan control requires --position-encoding none without --fan-positional-control")
         elif args.fan_positional_control:
@@ -204,6 +216,8 @@ def main() -> None:
                 )
                 if args.fan_positional_control:
                     run_argv.append("--fan-positional-control")
+                if args.atomic_position_period is not None:
+                    run_argv.extend(["--atomic-position-period", str(args.atomic_position_period)])
             if args.smoke:
                 run_argv.append("--smoke")
             print(f"[run] architecture={architecture} seed={seed}", flush=True)
@@ -217,6 +231,7 @@ def main() -> None:
         "architectures": args.architectures,
         "seeds": sorted(set(args.seeds)),
         "position_encoding": args.position_encoding,
+        "atomic_position_period": args.atomic_position_period,
         "smoke": args.smoke,
         "slot_first": args.slot_first,
         "extended_length": args.extended_length,

@@ -180,6 +180,11 @@ causal recurrent block, input injection, online curriculum, final-state CE를
   각각 한 token이 되는 구조화 입력이다. 이 조건은 NoPE를 유지하고 결과 track을
   `fan_atomic_nope_control`로 기록한다. 자연어 template의 parsing 비용을 제거하지만
   task와 최종 five-colour labels는 동일하다.
+- **atomic + periodic sinusoidal**: atomic 입력에 sinusoidal encoding을 쓰되
+  swap position id를 `--atomic-position-period p` 주기로 반복한다. 예를 들어
+  `p=5`이면 swap position은 `5..9,5..9,...`가 되고 SLOT position도 period 기준
+  terminal 위치에 고정된다. 결과 track은 `fan_atomic_periodic_sinusoidal_control`로
+  기록된다.
 
 ```bash
 # Template + sinusoidal positional control (not the Fan main condition).
@@ -200,6 +205,21 @@ python scripts/run_original_experiments.py \
   --architecture fan-recurrent \
   --position-encoding none \
   --fan-input-format atomic \
+  --online-training \
+  --train-steps 100000 \
+  --curriculum-min-swaps 2 --curriculum-max-swaps 10 \
+  --curriculum-steps-per-length 1000 \
+  --swaps-per-loop 1 \
+  --deep-supervision-weight 0 \
+  --seed 0 --device mps
+
+# Atomic semantic tokens + periodic sinusoidal control.
+python scripts/run_original_experiments.py \
+  --architecture fan-recurrent \
+  --position-encoding sinusoidal \
+  --fan-input-format atomic \
+  --fan-positional-control \
+  --atomic-position-period 5 \
   --online-training \
   --train-steps 100000 \
   --curriculum-min-swaps 2 --curriculum-max-swaps 10 \

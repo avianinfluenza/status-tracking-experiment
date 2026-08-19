@@ -66,6 +66,11 @@ def config_to_argv(config: dict[str, Any]) -> list[str]:
     )
     if fan_positional_control:
         arguments.append("--fan-positional-control")
+    _append(
+        arguments,
+        "--atomic-position-period",
+        config.get("atomic_position_period", model.get("atomic_position_period")),
+    )
     _append(arguments, "--d-model", config.get("d_model", model.get("d_model")))
     _append(arguments, "--n-heads", config.get("n_heads", model.get("n_heads")))
     _append(arguments, "--d-ff", config.get("d_ff", model.get("d_ff")))

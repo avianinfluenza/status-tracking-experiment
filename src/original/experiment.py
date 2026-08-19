@@ -595,6 +595,8 @@ def build_run_name(args: argparse.Namespace) -> str:
             name_parts.append(f"input{args.fan_input_format}")
         if args.fan_positional_control:
             name_parts.append("poscontrol")
+        if args.atomic_position_period is not None:
+            name_parts.append(f"posperiod{args.atomic_position_period:g}")
     if args.architecture == "direct":
         if args.direct_input_format != "template":
             name_parts.append(f"input{args.direct_input_format}")
@@ -1401,6 +1403,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="explicit template+sinusoidal control; never part of the NoPE Fan main condition",
     )
     parser.add_argument(
+        "--atomic-position-period",
+        type=int,
+        default=None,
+        help=(
+            "train/eval atomic Fan sinusoidal diagnostic: repeat swap position ids "
+            "with this period, e.g. 5 gives swap positions 5..9,5..9,..."
+        ),
+    )
+    parser.add_argument(
         "--direct-input-format",
         choices=("template", "atomic"),
         default="template",
@@ -1680,6 +1691,19 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         args.fan_input_format != "template" or args.fan_positional_control
     ):
         raise ValueError("Fan input and positional controls require --architecture fan-recurrent")
+    if args.atomic_position_period is not None:
+        if args.atomic_position_period < 1:
+            raise ValueError("--atomic-position-period must be positive")
+        if (
+            args.architecture != "fan-recurrent"
+            or args.fan_input_format != "atomic"
+            or args.position_encoding != "sinusoidal"
+            or not args.fan_positional_control
+        ):
+            raise ValueError(
+                "--atomic-position-period requires fan-recurrent atomic input "
+                "with sinusoidal positional control"
+            )
     if args.architecture != "direct" and (
         args.direct_input_format != "template" or args.direct_causal
     ):
@@ -1790,6 +1814,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         fan_positional_control=args.fan_positional_control,
         direct_input_format=args.direct_input_format,
         direct_causal=args.direct_causal,
+        atomic_position_period=args.atomic_position_period,
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -2237,7 +2262,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     run_finished_at = datetime.now()
     total_seconds = time.perf_counter() - run_started
     fan_track = (
-        "fan_atomic_sinusoidal_control"
+        "fan_atomic_periodic_sinusoidal_control"
+        if args.architecture == "fan-recurrent"
+        and args.fan_input_format == "atomic"
+        and args.fan_positional_control
+        and args.atomic_position_period is not None
+        else "fan_atomic_sinusoidal_control"
         if args.architecture == "fan-recurrent"
         and args.fan_input_format == "atomic"
         and args.fan_positional_control
@@ -2315,6 +2345,7 @@ def run(args: argparse.Namespace) -> dict[str, object]:
             "extended_length": args.extended_length,
             "fan_input_format": args.fan_input_format if args.architecture == "fan-recurrent" else None,
             "fan_positional_control": args.fan_positional_control if args.architecture == "fan-recurrent" else False,
+            "atomic_position_period": args.atomic_position_period,
             "direct_input_format": args.direct_input_format if args.architecture == "direct" else None,
             "direct_causal": args.direct_causal if args.architecture == "direct" else False,
         },
