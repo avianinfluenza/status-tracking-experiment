@@ -534,12 +534,58 @@ def test_atomic_position_period_config_applies_during_prepare() -> None:
     ]
 
 
-def test_atomic_position_period_rejects_non_atomic_sinusoidal_fan() -> None:
+def test_direct_atomic_position_period_config_applies_during_prepare() -> None:
+    batch = collate_fn([sample_row_with_swaps(7)], input_format="atomic")
+    model = DirectTransformer(
+        OriginalModelConfig(
+            architecture="direct",
+            position_encoding="sinusoidal",
+            direct_input_format="atomic",
+            direct_causal=True,
+            atomic_position_period=5,
+            d_model=32,
+            n_heads=4,
+            d_ff=64,
+            num_layers=1,
+        )
+    )
+
+    _, _, positions = model.prepare(batch["input_ids"], batch["attn_mask"])
+    assert positions[0, batch["attn_mask"][0].bool()].tolist() == [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        5,
+        6,
+        10,
+        11,
+        12,
+        13,
+        14,
+    ]
+
+
+def test_atomic_position_period_rejects_non_atomic_sinusoidal_models() -> None:
     with pytest.raises(ValueError, match="atomic_position_period requires"):
         OriginalModelConfig(
             architecture="fan-recurrent",
             position_encoding="sinusoidal",
             fan_positional_control=True,
+            atomic_position_period=5,
+        )
+    with pytest.raises(ValueError, match="atomic_position_period requires"):
+        OriginalModelConfig(
+            architecture="direct",
+            position_encoding="none",
+            direct_input_format="atomic",
+            direct_causal=True,
             atomic_position_period=5,
         )
     with pytest.raises(ValueError, match="atomic_position_period must be positive"):
@@ -592,7 +638,7 @@ def test_atomic_causal_direct_model_reads_atomic_collation() -> None:
 
 
 def test_online_direct_baseline_requires_atomic_causal_nope() -> None:
-    with pytest.raises(ValueError, match="atomic input, causal attention, and NoPE"):
+    with pytest.raises(ValueError, match="atomic input, causal attention"):
         run(
             parse_args(
                 [
@@ -604,6 +650,26 @@ def test_online_direct_baseline_requires_atomic_causal_nope() -> None:
                 ]
             )
         )
+
+
+def test_online_direct_baseline_allows_periodic_sinusoidal(tmp_path: Path) -> None:
+    result = run(parse_args([
+        "--architecture", "direct",
+        "--position-encoding", "sinusoidal",
+        "--direct-input-format", "atomic",
+        "--direct-causal",
+        "--atomic-position-period", "2",
+        "--online-training",
+        "--smoke",
+        "--device", "cpu",
+        "--no-progress",
+        "--output-dir", str(tmp_path),
+    ]))
+
+    assert result["track"] == "basic_atomic_periodic_sinusoidal_causal"
+    assert result["config"]["atomic_position_period"] == 2
+    assert result["config"]["direct_input_format"] == "atomic"
+    assert result["config"]["direct_causal"] is True
 
 
 def test_recurrent_r0_update_does_not_reinject_embedding() -> None:

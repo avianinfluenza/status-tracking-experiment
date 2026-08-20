@@ -97,15 +97,21 @@ class OriginalModelConfig:
         if self.atomic_position_period is not None:
             if self.atomic_position_period < 1:
                 raise ValueError("atomic_position_period must be positive")
-            if (
-                self.architecture != "fan-recurrent"
-                or self.fan_input_format != "atomic"
-                or self.position_encoding != "sinusoidal"
-                or not self.fan_positional_control
-            ):
+            fan_periodic = (
+                self.architecture == "fan-recurrent"
+                and self.fan_input_format == "atomic"
+                and self.position_encoding == "sinusoidal"
+                and self.fan_positional_control
+            )
+            direct_periodic = (
+                self.architecture == "direct"
+                and self.direct_input_format == "atomic"
+                and self.position_encoding == "sinusoidal"
+            )
+            if not (fan_periodic or direct_periodic):
                 raise ValueError(
-                    "atomic_position_period requires atomic fan-recurrent sinusoidal "
-                    "positional control"
+                    "atomic_position_period requires atomic sinusoidal fan-recurrent "
+                    "positional control or atomic sinusoidal direct input"
                 )
         if self.d_model <= 0 or self.d_model % self.n_heads:
             raise ValueError("d_model must be positive and divisible by n_heads")

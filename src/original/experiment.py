@@ -602,6 +602,8 @@ def build_run_name(args: argparse.Namespace) -> str:
             name_parts.append(f"input{args.direct_input_format}")
         if args.direct_causal:
             name_parts.append("causal")
+        if args.atomic_position_period is not None:
+            name_parts.append(f"posperiod{args.atomic_position_period:g}")
     if args.extended_length:
         name_parts.append("extended-length")
     if args.slot_first:
@@ -1694,28 +1696,40 @@ def run(args: argparse.Namespace) -> dict[str, object]:
     if args.atomic_position_period is not None:
         if args.atomic_position_period < 1:
             raise ValueError("--atomic-position-period must be positive")
-        if (
-            args.architecture != "fan-recurrent"
-            or args.fan_input_format != "atomic"
-            or args.position_encoding != "sinusoidal"
-            or not args.fan_positional_control
-        ):
+        fan_periodic = (
+            args.architecture == "fan-recurrent"
+            and args.fan_input_format == "atomic"
+            and args.position_encoding == "sinusoidal"
+            and args.fan_positional_control
+        )
+        direct_periodic = (
+            args.architecture == "direct"
+            and args.direct_input_format == "atomic"
+            and args.position_encoding == "sinusoidal"
+        )
+        if not (fan_periodic or direct_periodic):
             raise ValueError(
-                "--atomic-position-period requires fan-recurrent atomic input "
-                "with sinusoidal positional control"
+                "--atomic-position-period requires atomic sinusoidal fan-recurrent "
+                "positional control or atomic sinusoidal direct input"
             )
     if args.architecture != "direct" and (
         args.direct_input_format != "template" or args.direct_causal
     ):
         raise ValueError("direct input and causal controls require --architecture direct")
     if args.architecture == "direct" and args.online_training:
+        direct_nope = args.position_encoding == "none" and args.atomic_position_period is None
+        direct_periodic = (
+            args.position_encoding == "sinusoidal"
+            and args.atomic_position_period is not None
+        )
         if (
             args.direct_input_format != "atomic"
             or not args.direct_causal
-            or args.position_encoding != "none"
+            or not (direct_nope or direct_periodic)
         ):
             raise ValueError(
-                "online direct baseline requires atomic input, causal attention, and NoPE"
+                "online direct baseline requires atomic input, causal attention, "
+                "and either NoPE or periodic sinusoidal positions"
             )
     if args.architecture == "fan-recurrent":
         if args.fan_positional_control:
@@ -2277,6 +2291,12 @@ def run(args: argparse.Namespace) -> dict[str, object]:
         if args.architecture == "fan-recurrent" and args.fan_input_format == "atomic"
         else "fan_aligned"
         if args.architecture == "fan-recurrent"
+        else "basic_atomic_periodic_sinusoidal_causal"
+        if args.architecture == "direct"
+        and args.direct_input_format == "atomic"
+        and args.direct_causal
+        and args.position_encoding == "sinusoidal"
+        and args.atomic_position_period is not None
         else "basic_atomic_nope_causal"
         if args.architecture == "direct"
         and args.direct_input_format == "atomic"
